@@ -1,0 +1,14 @@
+# Expected file contents for btrfs RAID test fixtures.
+# Format: <profile> <path> <md5> <size>
+single  /hello.txt        -      hello-from-single\n
+single  /sub/blob.bin     9528d8a76a41a9809f82229ed77d0191 65536
+raid0   /hello.txt        -      hello-from-raid0\n
+raid0   /sub/blob.bin     ec625662bcc25b4309c77b840118938b 65536
+raid1   /hello.txt        -      hello-from-raid1\n
+raid1   /sub/blob.bin     3e70e020d7a312e412f6eb308823f3a4 65536
+raid10  /hello.txt        -      hello-from-raid10\n
+raid10  /sub/blob.bin     38a3e5848dea00ae6f0b93386ea60430 65536
+raid5   /hello.txt        -      hello-from-raid5\n
+raid5   /sub/blob.bin     a176df37793e09c064251c733ac2fa5f 65536
+raid6   /hello.txt        -      hello-from-raid6\n
+raid6   /sub/blob.bin     1ecb66994b91e6b9cfaae72c6196196c 65536

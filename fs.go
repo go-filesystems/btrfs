@@ -101,6 +101,14 @@ type FS interface {
 
 	Label() string
 	SetLabel(label string) error
+
+	// Filesystem-level resize. Grow extends; Shrink reduces (refuses to
+	// discard live data); Resize dispatches to whichever direction the
+	// new size implies (no-op when equal). All three require an idle
+	// FS — concurrent writers during a resize aren't safe.
+	Grow(newSizeBytes int64) error
+	Shrink(newSizeBytes int64) error
+	Resize(newSizeBytes int64) error
 }
 
 var _ FS = (*btrfsFS)(nil)

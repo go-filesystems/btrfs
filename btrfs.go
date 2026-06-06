@@ -65,4 +65,5 @@ var (
 	_ filesystem.Truncater      = (*btrfsFS)(nil)
 	_ filesystem.MetadataSetter = (*btrfsFS)(nil)
 	_ filesystem.Labeller       = (*btrfsFS)(nil)
+	_ filesystem.Grower         = (*btrfsFS)(nil)
 )

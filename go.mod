@@ -7,6 +7,8 @@ require (
 	github.com/klauspost/compress v1.18.6
 )
 
+require github.com/anchore/go-lzo v0.1.0
+
 replace github.com/go-diskimages/qcow2 => ../../go-diskimages/qcow2
 
 replace github.com/go-filesystems/interface => ../interface

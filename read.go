@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // EXTENT_DATA item layout (btrfs_file_extent_item):
@@ -127,7 +129,7 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint6
 // decompressExtent expands a compressed extent payload. When compression is
 // 0 (none), src is returned as-is. ramBytes is the expected decompressed
 // length and bounds the output buffer to avoid runaway allocations on
-// malformed input. Lzo / Zstd are not yet implemented and return an error.
+// malformed input.
 func decompressExtent(src []byte, compression uint8, ramBytes uint64) ([]byte, error) {
 	switch compression {
 	case compressionNone:
@@ -150,12 +152,33 @@ func decompressExtent(src []byte, compression uint8, ramBytes uint64) ([]byte, e
 		}
 		return out, nil
 	case compressionLzo:
-		return nil, fmt.Errorf("btrfs: lzo decompression not implemented")
+		return decompressLzo(src, ramBytes)
 	case compressionZstd:
-		return nil, fmt.Errorf("btrfs: zstd decompression not implemented")
+		return decompressZstd(src, ramBytes)
 	default:
 		return nil, fmt.Errorf("btrfs: unknown compression code %d", compression)
 	}
+}
+
+// decompressZstd decompresses a btrfs zstd-compressed extent. The
+// klauspost/compress zstd decoder handles all on-disk zstd frames produced
+// by the kernel; ramBytes caps the output to defend against malformed
+// input.
+func decompressZstd(src []byte, ramBytes uint64) ([]byte, error) {
+	zr, err := zstd.NewReader(bytes.NewReader(src))
+	if err != nil {
+		return nil, fmt.Errorf("zstd reader: %w", err)
+	}
+	defer zr.Close()
+	limit := int64(ramBytes) + 1
+	if limit <= 0 {
+		limit = 1 << 30
+	}
+	out, err := io.ReadAll(io.LimitReader(zr, limit))
+	if err != nil {
+		return nil, fmt.Errorf("zstd decompress: %w", err)
+	}
+	return out, nil
 }
 
 // readSymlink reads the target of a symlink inode.

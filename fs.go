@@ -102,6 +102,16 @@ type FS interface {
 	Label() string
 	SetLabel(label string) error
 
+	// Subvolume / snapshot READ support. Subvolumes enumerates the subvolumes
+	// and snapshots recorded in the ROOT_TREE (including the default FS_TREE,
+	// id 5). OpenSubvolumeBy{ID,Name} return a read-only filesystem.Filesystem
+	// rooted at the named subvolume/snapshot tree so ReadFile / ListDir / Stat
+	// / ReadLink operate within it. Creation of subvolumes/snapshots is not
+	// supported (it needs ref-counted extent backrefs).
+	Subvolumes() ([]Subvolume, error)
+	OpenSubvolumeByID(id uint64) (filesystem.Filesystem, error)
+	OpenSubvolumeByName(name string) (filesystem.Filesystem, error)
+
 	// Filesystem-level resize. Grow extends; Shrink reduces (refuses to
 	// discard live data); Resize dispatches to whichever direction the
 	// new size implies (no-op when equal). All three require an idle

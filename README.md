@@ -14,7 +14,6 @@ https://btrfs.readthedocs.io/en/latest/
 |---|---:|---|
 | Open / Close | ✅ | Single-device images supported |
 | Format | ✅ | Creates a new Btrfs image |
-| Resize | ✅ | `Grow` supported; `Shrink` limited (live-extent relocation not implemented) |
 | ReadFile | ✅ | Full file reads supported |
 | WriteFile | ✅ | Full file writes supported |
 | MkDir / Delete / Rename | ✅ | Directory and rename operations supported |

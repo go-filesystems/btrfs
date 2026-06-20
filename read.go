@@ -160,32 +160,22 @@ func decompressExtent(src []byte, compression uint8, ramBytes uint64) ([]byte, e
 	}
 }
 
-// decompressZstd decompresses a btrfs zstd-compressed extent.
-//
-// On disk, the kernel stores a single zstd frame and then zero-pads the
-// remainder of the extent up to the sector size (e.g. the frame may be 65
-// bytes while disk_num_bytes is 4096). Streaming the whole on-disk buffer
-// through zstd.NewReader + io.ReadAll fails once the decoder finishes the
-// real frame and tries to parse the trailing zero padding as a second frame
-// ("magic number mismatch"). zlib/LZO avoid this because their decoders stop
-// at the declared/stream end.
-//
-// btrfs always records the exact decompressed length in ram_bytes, so we
-// decode exactly that many bytes via io.ReadFull. The decoder never advances
-// into the padding, mirroring the stop-at-declared-end behaviour of the
-// other codecs. ramBytes also bounds the output buffer to defend against
-// malformed input.
+// decompressZstd decompresses a btrfs zstd-compressed extent. The
+// klauspost/compress zstd decoder handles all on-disk zstd frames produced
+// by the kernel; ramBytes caps the output to defend against malformed
+// input.
 func decompressZstd(src []byte, ramBytes uint64) ([]byte, error) {
 	zr, err := zstd.NewReader(bytes.NewReader(src))
 	if err != nil {
 		return nil, fmt.Errorf("zstd reader: %w", err)
 	}
 	defer zr.Close()
-	if ramBytes == 0 {
-		return nil, nil
+	limit := int64(ramBytes) + 1
+	if limit <= 0 {
+		limit = 1 << 30
 	}
-	out := make([]byte, ramBytes)
-	if _, err := io.ReadFull(zr, out); err != nil {
+	out, err := io.ReadAll(io.LimitReader(zr, limit))
+	if err != nil {
 		return nil, fmt.Errorf("zstd decompress: %w", err)
 	}
 	return out, nil

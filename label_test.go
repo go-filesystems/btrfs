@@ -139,7 +139,7 @@ func TestBtrfsSetLabel_UpdatesSuperblockCRC(t *testing.T) {
 		t.Fatalf("ReadAt: %v", err)
 	}
 	storedCRC := binary.LittleEndian.Uint32(buf[:4])
-	wantCRC := crc32cSum(buf[32:sbfSize], ^uint32(0))
+	wantCRC := crc32cSum(buf[32:sbfSize], btrfsCsumSeed)
 	if storedCRC != wantCRC {
 		t.Errorf("primary superblock CRC mismatch: stored=0x%08x want=0x%08x", storedCRC, wantCRC)
 	}

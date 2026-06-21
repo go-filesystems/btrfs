@@ -1,4 +1,10 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-filesystems/brand/main/social/go-filesystems-btrfs.png" alt="go-filesystems/btrfs" width="720"></p>
+
 # filesystem-btrfs
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-filesystems/btrfs.svg)](https://pkg.go.dev/github.com/go-filesystems/btrfs)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![CI](https://github.com/go-filesystems/btrfs/actions/workflows/ci.yml/badge.svg)](https://github.com/go-filesystems/btrfs/actions/workflows/ci.yml)
 
 Pure-Go read/write access to Btrfs filesystem images — no root privileges, no external tools, no CGO.
 

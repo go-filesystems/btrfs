@@ -31,6 +31,8 @@ const (
 	svtSubvolName    = "snap1"
 	svtSubvolFile    = "hello.txt"
 	svtSubvolFileTxt = "inside the subvolume\n"
+	svtSubvolLink    = "link"   // symlink in the subvolume root
+	svtSubvolLinkTgt = "hello.txt"
 )
 
 // buildSubvolFixture writes a synthetic btrfs image with a default FS_TREE and
@@ -114,6 +116,30 @@ func buildSubvolFixture(t *testing.T) string {
 	// Directory entry in the subvolume root pointing at the file.
 	_ = leafInsertItem(subLeaf, key{rootDirObjID, typeDirIndex, 3},
 		encodeDirItem(fileIno, typeInodeItem, ftRegFile, svtSubvolFile))
+
+	// Symlink inode (ino 258): inline EXTENT_DATA holding the target path.
+	const linkIno = fileIno + 1
+	linode := make([]byte, inodeItemSize)
+	le.PutUint64(linode[inodeOffGeneration:], 1)
+	le.PutUint32(linode[inodeOffNLink:], 1)
+	le.PutUint32(linode[inodeOffMode:], 0xA1FF) // symlink lrwxrwxrwx
+	le.PutUint64(linode[inodeOffSize:], uint64(len(svtSubvolLinkTgt)))
+	le.PutUint64(linode[inodeOffFlags:], inodeFlagNoDataSum)
+	writeBtrfsTimespec(linode[inodeOffATime:], now)
+	writeBtrfsTimespec(linode[inodeOffCTime:], now)
+	writeBtrfsTimespec(linode[inodeOffMTime:], now)
+	writeBtrfsTimespec(linode[inodeOffOTime:], now)
+	_ = leafInsertItem(subLeaf, key{linkIno, typeInodeItem, 0}, linode)
+
+	lext := make([]byte, extDataHdrSize+len(svtSubvolLinkTgt))
+	le.PutUint64(lext[extDataOffRamBytes:], uint64(len(svtSubvolLinkTgt)))
+	lext[extDataOffCompression] = compressionNone
+	lext[extDataOffType] = extentDataInline
+	copy(lext[extDataHdrSize:], svtSubvolLinkTgt)
+	_ = leafInsertItem(subLeaf, key{linkIno, typeExtentData, 0}, lext)
+
+	_ = leafInsertItem(subLeaf, key{rootDirObjID, typeDirIndex, 4},
+		encodeDirItem(linkIno, typeInodeItem, ftSymlink, svtSubvolLink))
 	updateNodeCRC(subLeaf)
 
 	// ── ROOT_TREE leaf: ROOT_ITEM(5), ROOT_ITEM(256), ROOT_REF(5->256) ──────
@@ -323,5 +349,200 @@ func TestSubvolume_DefaultTreeStillReads(t *testing.T) {
 	defer view.Close()
 	if _, err := view.ListDir("/"); err != nil {
 		t.Fatalf("default subvol view ListDir(/): %v", err)
+	}
+}
+
+// TestParseRootRef covers the decoder's happy path and its short-buffer /
+// truncated-name rejection branches.
+func TestParseRootRef(t *testing.T) {
+	le := binary.LittleEndian
+
+	// Happy path: a well-formed ROOT_REF payload.
+	const name = "child"
+	good := make([]byte, rootRefHdrSize+len(name))
+	le.PutUint64(good[0:], 42) // dirid
+	le.PutUint64(good[8:], 7)  // sequence
+	le.PutUint16(good[16:], uint16(len(name)))
+	copy(good[rootRefHdrSize:], name)
+	rr, ok := parseRootRef(good)
+	if !ok {
+		t.Fatalf("parseRootRef(good) ok = false")
+	}
+	if rr.dirID != 42 || rr.name != name {
+		t.Errorf("parseRootRef(good) = %+v, want dirID=42 name=%q", rr, name)
+	}
+
+	// Buffer shorter than the fixed header.
+	if _, ok := parseRootRef(make([]byte, rootRefHdrSize-1)); ok {
+		t.Error("parseRootRef(short header) ok = true, want false")
+	}
+
+	// name_len claims more bytes than the buffer holds.
+	trunc := make([]byte, rootRefHdrSize+2)
+	le.PutUint16(trunc[16:], 100) // far beyond the 2 trailing bytes
+	if _, ok := parseRootRef(trunc); ok {
+		t.Error("parseRootRef(truncated name) ok = true, want false")
+	}
+}
+
+// TestSubvolume_Stat exercises Stat on a subvolume view for both a regular
+// file and a directory, plus the not-found error path.
+func TestSubvolume_Stat(t *testing.T) {
+	path := buildSubvolFixture(t)
+	fs, err := Open(path, -1)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer fs.Close()
+
+	view, err := fs.OpenSubvolumeByID(svtSubvolID)
+	if err != nil {
+		t.Fatalf("OpenSubvolumeByID: %v", err)
+	}
+	defer view.Close()
+
+	st, err := view.Stat("/" + svtSubvolFile)
+	if err != nil {
+		t.Fatalf("subvol Stat(file): %v", err)
+	}
+	if st.Size() != uint64(len(svtSubvolFileTxt)) {
+		t.Errorf("Stat size = %d, want %d", st.Size(), len(svtSubvolFileTxt))
+	}
+	if st.Mode()&0xF000 != 0x8000 {
+		t.Errorf("Stat(%q).Mode() = %#o, want regular file", svtSubvolFile, st.Mode())
+	}
+
+	dst, err := view.Stat("/")
+	if err != nil {
+		t.Fatalf("subvol Stat(/): %v", err)
+	}
+	if dst.Mode()&0xF000 != 0x4000 {
+		t.Errorf("Stat(/).Mode() = %#o, want directory", dst.Mode())
+	}
+
+	if _, err := view.Stat("/nope"); err == nil {
+		t.Error("Stat of nonexistent path: expected error")
+	}
+}
+
+// TestSubvolume_ReadLink exercises ReadLink on a subvolume view, including the
+// not-a-symlink and not-found error paths.
+func TestSubvolume_ReadLink(t *testing.T) {
+	path := buildSubvolFixture(t)
+	fs, err := Open(path, -1)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer fs.Close()
+
+	view, err := fs.OpenSubvolumeByID(svtSubvolID)
+	if err != nil {
+		t.Fatalf("OpenSubvolumeByID: %v", err)
+	}
+	defer view.Close()
+
+	tgt, err := view.ReadLink("/" + svtSubvolLink)
+	if err != nil {
+		t.Fatalf("subvol ReadLink: %v", err)
+	}
+	if tgt != svtSubvolLinkTgt {
+		t.Errorf("ReadLink = %q, want %q", tgt, svtSubvolLinkTgt)
+	}
+
+	// A regular file is not a symlink.
+	if _, err := view.ReadLink("/" + svtSubvolFile); err == nil {
+		t.Error("ReadLink of regular file: expected error")
+	}
+	// Missing path.
+	if _, err := view.ReadLink("/nope"); err == nil {
+		t.Error("ReadLink of nonexistent path: expected error")
+	}
+}
+
+// TestSubvolume_ReadFileErrors covers the non-regular-file and not-found
+// branches of the subvolume view's ReadFile.
+func TestSubvolume_ReadFileErrors(t *testing.T) {
+	path := buildSubvolFixture(t)
+	fs, err := Open(path, -1)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer fs.Close()
+
+	view, err := fs.OpenSubvolumeByID(svtSubvolID)
+	if err != nil {
+		t.Fatalf("OpenSubvolumeByID: %v", err)
+	}
+	defer view.Close()
+
+	// The root path is a directory, not a regular file.
+	if _, err := view.ReadFile("/"); err == nil {
+		t.Error("ReadFile of directory: expected error")
+	}
+	if _, err := view.ReadFile("/nope"); err == nil {
+		t.Error("ReadFile of nonexistent path: expected error")
+	}
+	// ListDir of a regular file must fail.
+	if _, err := view.ListDir("/" + svtSubvolFile); err == nil {
+		t.Error("ListDir of regular file: expected error")
+	}
+	if _, err := view.ListDir("/nope"); err == nil {
+		t.Error("ListDir of nonexistent path: expected error")
+	}
+}
+
+// TestSubvolume_ReadOnly verifies that every mutating operation on a subvolume
+// view is rejected with errSubvolReadOnly.
+func TestSubvolume_ReadOnly(t *testing.T) {
+	path := buildSubvolFixture(t)
+	fs, err := Open(path, -1)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer fs.Close()
+
+	view, err := fs.OpenSubvolumeByID(svtSubvolID)
+	if err != nil {
+		t.Fatalf("OpenSubvolumeByID: %v", err)
+	}
+	defer view.Close()
+
+	checks := []struct {
+		name string
+		err  error
+	}{
+		{"WriteFile", view.WriteFile("/x", []byte("x"), 0o644)},
+		{"MkDir", view.MkDir("/d", 0o755)},
+		{"DeleteFile", view.DeleteFile("/" + svtSubvolFile)},
+		{"DeleteDir", view.DeleteDir("/")},
+		{"Rename", view.Rename("/"+svtSubvolFile, "/y")},
+	}
+	for _, c := range checks {
+		if c.err != errSubvolReadOnly {
+			t.Errorf("%s: err = %v, want %v", c.name, c.err, errSubvolReadOnly)
+		}
+	}
+}
+
+// TestSubvolume_CloseNoop confirms Close on a subvolume view is a no-op that
+// does not disturb the parent FS.
+func TestSubvolume_CloseNoop(t *testing.T) {
+	path := buildSubvolFixture(t)
+	fs, err := Open(path, -1)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer fs.Close()
+
+	view, err := fs.OpenSubvolumeByID(svtSubvolID)
+	if err != nil {
+		t.Fatalf("OpenSubvolumeByID: %v", err)
+	}
+	if err := view.Close(); err != nil {
+		t.Fatalf("view.Close: %v", err)
+	}
+	// Parent FS must still be usable after closing the borrowed view.
+	if _, err := fs.ListDir("/"); err != nil {
+		t.Fatalf("parent ListDir after view close: %v", err)
 	}
 }

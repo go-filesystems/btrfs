@@ -1,4 +1,4 @@
-// Package btrfs provides read-only access to Btrfs filesystem images.
+// Package btrfs provides read/write access to Btrfs filesystem images.
 // It targets the common Btrfs on-disk format (single device, CRC32c checksums)
 // as used by Fedora Cloud images.
 //
@@ -6,8 +6,15 @@
 // to auto-select the first Linux data partition.
 //
 // Supported operations:
-//   - Open, Close
+//   - Open, Close, Format (single device)
 //   - ReadFile, ListDir, Stat, ReadLink
+//   - WriteFile, MkDir, DeleteFile, DeleteDir, Rename
+//   - Symlink, Link, Truncate
+//   - Chmod, Chown, Chtimes, get/set volume label, get/set xattrs
+//   - Grow / Resize (shrink trims free trailing space only)
+//
+// Multi-device profiles (RAID0/1/10/5/6/DUP) are decoded for reading;
+// writes are single-device.
 package filesystem_btrfs
 
 import filesystem "github.com/go-filesystems/interface"

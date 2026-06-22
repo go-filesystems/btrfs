@@ -322,35 +322,37 @@ func (v *subvolView) ReadFile(path string) ([]byte, error) {
 	p := v.parent
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	in, err := pathLookup(p.f, p.partOffset, p.sb, v.fsTreeRoot, path)
+	r := p.reader()
+	in, err := pathLookup(r, p.partOffset, p.sb, v.fsTreeRoot, path)
 	if err != nil {
 		return nil, err
 	}
 	if !in.isRegular() {
 		return nil, fmt.Errorf("btrfs: %q is not a regular file", path)
 	}
-	return readFileData(p.f, p.partOffset, p.sb, v.fsTreeRoot, in)
+	return readFileData(r, p.partOffset, p.sb, v.fsTreeRoot, in)
 }
 
 func (v *subvolView) ListDir(path string) ([]filesystem.DirEntry, error) {
 	p := v.parent
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	in, err := pathLookup(p.f, p.partOffset, p.sb, v.fsTreeRoot, path)
+	r := p.reader()
+	in, err := pathLookup(r, p.partOffset, p.sb, v.fsTreeRoot, path)
 	if err != nil {
 		return nil, err
 	}
 	if !in.isDir() {
 		return nil, fmt.Errorf("btrfs: %q is not a directory", path)
 	}
-	return readDir(p.f, p.partOffset, p.sb, v.fsTreeRoot, in.num)
+	return readDir(r, p.partOffset, p.sb, v.fsTreeRoot, in.num)
 }
 
 func (v *subvolView) Stat(path string) (filesystem.Stat, error) {
 	p := v.parent
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	in, err := pathLookup(p.f, p.partOffset, p.sb, v.fsTreeRoot, path)
+	in, err := pathLookup(p.reader(), p.partOffset, p.sb, v.fsTreeRoot, path)
 	if err != nil {
 		return nil, err
 	}
@@ -361,14 +363,15 @@ func (v *subvolView) ReadLink(path string) (string, error) {
 	p := v.parent
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	in, err := pathLookup(p.f, p.partOffset, p.sb, v.fsTreeRoot, path)
+	r := p.reader()
+	in, err := pathLookup(r, p.partOffset, p.sb, v.fsTreeRoot, path)
 	if err != nil {
 		return "", err
 	}
 	if !in.isSymlink() {
 		return "", fmt.Errorf("btrfs: %q is not a symbolic link", path)
 	}
-	return readSymlink(p.f, p.partOffset, p.sb, v.fsTreeRoot, in)
+	return readSymlink(r, p.partOffset, p.sb, v.fsTreeRoot, in)
 }
 
 // Mutating operations are unsupported on a subvolume view.

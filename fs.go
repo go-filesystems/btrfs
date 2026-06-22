@@ -65,6 +65,12 @@ type btrfsFS struct {
 	fsTreeRoot uint64 // logical address of the FS_TREE root node
 	sm         *spaceManager
 	mu         sync.Mutex
+
+	// cache memoizes decoded B-tree nodes by logical address across the
+	// metadata-heavy read paths. Built lazily by reader(); dropped by
+	// invalidateCache() before any mutating operation returns, because a
+	// write (COW) changes the tree and may recycle logical addresses.
+	cache *cachedReader
 }
 
 // osFileRWA adapts *os.File to readerWriterAt.
@@ -234,14 +240,15 @@ func (fs *btrfsFS) ReadFile(path string) ([]byte, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	in, err := pathLookup(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, path)
+	r := fs.reader()
+	in, err := pathLookup(r, fs.partOffset, fs.sb, fs.fsTreeRoot, path)
 	if err != nil {
 		return nil, err
 	}
 	if !in.isRegular() {
 		return nil, fmt.Errorf("btrfs: %q is not a regular file", path)
 	}
-	return readFileData(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, in)
+	return readFileData(r, fs.partOffset, fs.sb, fs.fsTreeRoot, in)
 }
 
 // ListDir returns the directory entries of the directory at path.
@@ -249,14 +256,15 @@ func (fs *btrfsFS) ListDir(path string) ([]filesystem.DirEntry, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	in, err := pathLookup(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, path)
+	r := fs.reader()
+	in, err := pathLookup(r, fs.partOffset, fs.sb, fs.fsTreeRoot, path)
 	if err != nil {
 		return nil, err
 	}
 	if !in.isDir() {
 		return nil, fmt.Errorf("btrfs: %q is not a directory", path)
 	}
-	return readDir(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, in.num)
+	return readDir(r, fs.partOffset, fs.sb, fs.fsTreeRoot, in.num)
 }
 
 // Stat returns basic metadata for the file or directory at path.
@@ -264,7 +272,7 @@ func (fs *btrfsFS) Stat(path string) (filesystem.Stat, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	in, err := pathLookup(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, path)
+	in, err := pathLookup(fs.reader(), fs.partOffset, fs.sb, fs.fsTreeRoot, path)
 	if err != nil {
 		return nil, err
 	}
@@ -276,20 +284,22 @@ func (fs *btrfsFS) ReadLink(path string) (string, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	in, err := pathLookup(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, path)
+	r := fs.reader()
+	in, err := pathLookup(r, fs.partOffset, fs.sb, fs.fsTreeRoot, path)
 	if err != nil {
 		return "", err
 	}
 	if !in.isSymlink() {
 		return "", fmt.Errorf("btrfs: %q is not a symbolic link", path)
 	}
-	return readSymlink(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, in)
+	return readSymlink(r, fs.partOffset, fs.sb, fs.fsTreeRoot, in)
 }
 
 // WriteFile creates or overwrites the file at path with the given data and permissions.
 func (fs *btrfsFS) WriteFile(path string, data []byte, perm os.FileMode) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return writeFile(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, path, data, perm)
 }
 
@@ -297,6 +307,7 @@ func (fs *btrfsFS) WriteFile(path string, data []byte, perm os.FileMode) error {
 func (fs *btrfsFS) MkDir(path string, perm os.FileMode) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return makeDir(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, path, perm)
 }
 
@@ -304,6 +315,7 @@ func (fs *btrfsFS) MkDir(path string, perm os.FileMode) error {
 func (fs *btrfsFS) DeleteFile(path string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return deleteFile(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, path)
 }
 
@@ -311,6 +323,7 @@ func (fs *btrfsFS) DeleteFile(path string) error {
 func (fs *btrfsFS) DeleteDir(path string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return deleteDir(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, path)
 }
 
@@ -318,6 +331,7 @@ func (fs *btrfsFS) DeleteDir(path string) error {
 func (fs *btrfsFS) Rename(oldPath, newPath string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return renameEntry(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, oldPath, newPath)
 }
 
@@ -328,6 +342,7 @@ func (fs *btrfsFS) Rename(oldPath, newPath string) error {
 func (fs *btrfsFS) Link(oldPath, newPath string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return linkInode(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, oldPath, newPath)
 }
 
@@ -338,6 +353,7 @@ func (fs *btrfsFS) Link(oldPath, newPath string) error {
 func (fs *btrfsFS) Symlink(target, linkPath string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return symlinkInode(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, target, linkPath)
 }
 
@@ -347,6 +363,7 @@ func (fs *btrfsFS) Symlink(target, linkPath string) error {
 func (fs *btrfsFS) Chown(path string, uid, gid uint32) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return chownInode(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, path, uid, gid)
 }
 
@@ -356,6 +373,7 @@ func (fs *btrfsFS) Chown(path string, uid, gid uint32) error {
 func (fs *btrfsFS) Chmod(path string, perm os.FileMode) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return chmodInode(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, path, perm)
 }
 
@@ -364,6 +382,7 @@ func (fs *btrfsFS) Chmod(path string, perm os.FileMode) error {
 func (fs *btrfsFS) Chtimes(path string, atime, mtime time.Time) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return chtimesInode(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, path, atime, mtime)
 }
 
@@ -377,6 +396,7 @@ func (fs *btrfsFS) Truncate(path string, newSize int64) error {
 	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return truncateInode(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, path, uint64(newSize))
 }
 
@@ -386,7 +406,7 @@ func (fs *btrfsFS) Truncate(path string, newSize int64) error {
 func (fs *btrfsFS) GetXattr(path, name string) ([]byte, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return getXattrInode(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, path, name)
+	return getXattrInode(fs.reader(), fs.partOffset, fs.sb, fs.fsTreeRoot, path, name)
 }
 
 // SetXattr attaches an xattr (name, value) to the inode at path, creating
@@ -395,6 +415,7 @@ func (fs *btrfsFS) GetXattr(path, name string) ([]byte, error) {
 func (fs *btrfsFS) SetXattr(path, name string, value []byte) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return setXattrInode(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, path, name, value)
 }
 
@@ -404,6 +425,7 @@ func (fs *btrfsFS) SetXattr(path, name string, value []byte) error {
 func (fs *btrfsFS) RemoveXattr(path, name string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 	return removeXattrInode(fs.rwa, fs.f, fs.partOffset, fs.sb, fs.sm, &fs.fsTreeRoot, path, name)
 }
 
@@ -415,11 +437,12 @@ func (fs *btrfsFS) RemoveXattr(path, name string) error {
 func (fs *btrfsFS) Xattrs(path string) (map[string][]byte, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	in, err := pathLookup(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, path)
+	r := fs.reader()
+	in, err := pathLookup(r, fs.partOffset, fs.sb, fs.fsTreeRoot, path)
 	if err != nil {
 		return nil, err
 	}
-	items, err := collectPrefixItems(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, in.num, typeXattrItem)
+	items, err := collectPrefixItems(r, fs.partOffset, fs.sb, fs.fsTreeRoot, in.num, typeXattrItem)
 	if err != nil {
 		if isNotFoundErr(err) {
 			return map[string][]byte{}, nil

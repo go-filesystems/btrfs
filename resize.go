@@ -69,6 +69,7 @@ func (fs *btrfsFS) Grow(newSizeBytes int64) error {
 	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 
 	cur := int64(fs.sb.totalBytes)
 	if newSizeBytes == cur {
@@ -145,6 +146,7 @@ func (fs *btrfsFS) Shrink(newSizeBytes int64) error {
 	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.invalidateCache()
 
 	cur := int64(fs.sb.totalBytes)
 	if newSizeBytes == cur {

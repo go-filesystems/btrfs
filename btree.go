@@ -105,6 +105,28 @@ func (it leafItem) data(buf []byte) []byte {
 // readNode reads the node at the given logical address.
 // It uses the chunk resolver in sb to convert logical -> physical.
 func readNode(r io.ReaderAt, partOff int64, sb *superblock, logAddr uint64) ([]byte, error) {
+	// Serve from the node cache when the reader provides one. Btrfs is COW, so
+	// a logical address holds the same block content for the life of the cache;
+	// memoizing decoded interior nodes eliminates the repeated root/upper-level
+	// re-reads that dominate metadata-heavy reads. Callers treat node buffers as
+	// read-only, so handing back the cached slice is safe.
+	if nc, ok := r.(nodeCacher); ok {
+		if buf, hit := nc.cachedNode(logAddr); hit {
+			return buf, nil
+		}
+		buf, err := readNodeUncached(r, partOff, sb, logAddr)
+		if err != nil {
+			return nil, err
+		}
+		nc.putNode(logAddr, buf)
+		return buf, nil
+	}
+	return readNodeUncached(r, partOff, sb, logAddr)
+}
+
+// readNodeUncached reads and validates a node directly from the device,
+// bypassing any cache.
+func readNodeUncached(r io.ReaderAt, partOff int64, sb *superblock, logAddr uint64) ([]byte, error) {
 	phys, err := sb.physAddr(partOff, logAddr)
 	if err != nil {
 		return nil, err

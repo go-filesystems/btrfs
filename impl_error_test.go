@@ -47,7 +47,7 @@ func TestOpen_ReopenAfterLargeWrite(t *testing.T) {
 // ── Open: error paths ─────────────────────────────────────────────────────
 
 func TestOpen_PartitionOffsetError(t *testing.T) {
-	// Build a GPT image where gptPartOffset will fail (small entrySize)
+	// Build a GPT image where partitionOffset will fail (small entrySize)
 	raw := make([]byte, 3*sectorSize+512)
 	le := binary.LittleEndian
 

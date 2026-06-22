@@ -31,7 +31,7 @@ const (
 	svtSubvolName    = "snap1"
 	svtSubvolFile    = "hello.txt"
 	svtSubvolFileTxt = "inside the subvolume\n"
-	svtSubvolLink    = "link"   // symlink in the subvolume root
+	svtSubvolLink    = "link" // symlink in the subvolume root
 	svtSubvolLinkTgt = "hello.txt"
 )
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/go-volumes/safeio"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -44,11 +45,27 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint6
 		return nil, fmt.Errorf("btrfs: read extents for inode %d: %w", in.num, err)
 	}
 
-	out := make([]byte, in.size)
+	// H1: in.size is an attacker-controlled uint64 (up to 2^63). Bound the
+	// output allocation against the backing device size — no file can be
+	// larger than the device that holds it.
+	dev := deviceSize(r)
+	out, err := safeio.MakeBytes(int64(in.size), dev)
+	if err != nil {
+		return nil, fmt.Errorf("btrfs: inode %d declared size %d: %w", in.num, in.size, err)
+	}
+	outLen := len(out)
 	le := binary.LittleEndian
 
 	for _, m := range items {
 		fileOffset := m.k.offset // byte offset within the file
+		// H2: a forged EXTENT_DATA key offset can exceed the file size; an
+		// unguarded `in.size - fileOffset` underflows (wraps huge) and
+		// `out[fileOffset:]` slices out of bounds. Skip extents that start at
+		// or beyond EOF.
+		if fileOffset >= in.size {
+			continue
+		}
+		remaining := in.size - fileOffset // > 0, no underflow
 		d := m.data
 		if len(d) <= extDataOffType {
 			continue
@@ -59,17 +76,24 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint6
 		case extentDataInline:
 			// Inline: data immediately follows the header.
 			rawInline := d[extDataHdrSize:]
-			ramBytes := le.Uint64(d[extDataOffRamBytes:])
+			// H4: clamp the attacker's ram_bytes to a hard ceiling and to the
+			// remaining file bytes before using it as a decompression bound.
+			ramBytes := clampRAM(le.Uint64(d[extDataOffRamBytes:]), remaining)
 			inlineData, err := decompressExtent(rawInline, compression, ramBytes)
 			if err != nil {
 				return nil, fmt.Errorf("btrfs: inode %d inline extent at file offset %d: %w",
 					in.num, fileOffset, err)
 			}
 			n := uint64(len(inlineData))
-			if fileOffset+n > in.size {
-				n = in.size - fileOffset
+			if n > remaining {
+				n = remaining
 			}
-			copy(out[fileOffset:], inlineData[:n])
+			// Bounds-check the destination slice (overflow-safe) before copy.
+			dst, err := safeio.Slice(out, int(fileOffset), int(n))
+			if err != nil {
+				return nil, fmt.Errorf("btrfs: inode %d inline extent dest [%d,+%d): %w", in.num, fileOffset, n, err)
+			}
+			copy(dst, inlineData[:n])
 
 		case extentDataRegular:
 			if len(d) < extDataRegularSize {
@@ -83,8 +107,12 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint6
 			diskNumBytes := le.Uint64(d[extDataOffDiskNumBytes:])
 			extOffset := le.Uint64(d[extDataOffOffset:])
 			numBytes := le.Uint64(d[extDataOffNumBytes:])
-			if fileOffset+numBytes > in.size {
-				numBytes = in.size - fileOffset
+			if numBytes > remaining {
+				numBytes = remaining
+			}
+			// Overflow-safe destination bounds [fileOffset, fileOffset+numBytes).
+			if err := safeio.CheckBounds(int(fileOffset), int(numBytes), outLen); err != nil {
+				return nil, fmt.Errorf("btrfs: inode %d extent dest [%d,+%d): %w", in.num, fileOffset, numBytes, err)
 			}
 			if compression == compressionNone {
 				phys, err := sb.physAddr(partOff, diskBytenr+extOffset)
@@ -100,30 +128,64 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint6
 			// Compressed extent: read the on-disk compressed payload at
 			// diskBytenr (size = diskNumBytes), decompress to the full
 			// ram_bytes, then copy [extOffset, extOffset+numBytes) into out.
-			ramBytes := le.Uint64(d[extDataOffRamBytes:])
+			// H3: diskNumBytes is attacker-controlled; bound the read buffer
+			// against the device size.
+			compressed, err := safeio.MakeBytes(int64(diskNumBytes), dev)
+			if err != nil {
+				return nil, fmt.Errorf("btrfs: inode %d compressed extent disk_num_bytes %d: %w", in.num, diskNumBytes, err)
+			}
 			phys, err := sb.physAddr(partOff, diskBytenr)
 			if err != nil {
 				return nil, fmt.Errorf("btrfs: inode %d extent at file offset %d: %w",
 					in.num, fileOffset, err)
 			}
-			compressed := make([]byte, diskNumBytes)
 			if _, err := r.ReadAt(compressed, phys); err != nil {
 				return nil, fmt.Errorf("btrfs: read compressed extent data: %w", err)
 			}
+			// H4: clamp ram_bytes to (extOffset+numBytes) and to the hard
+			// ceiling so a huge declared ram_bytes can't drive a giant alloc.
+			ramBytes := clampRAM(le.Uint64(d[extDataOffRamBytes:]), extOffset+numBytes)
 			decompressed, err := decompressExtent(compressed, compression, ramBytes)
 			if err != nil {
 				return nil, fmt.Errorf("btrfs: inode %d extent at file offset %d: %w",
 					in.num, fileOffset, err)
 			}
-			if uint64(len(decompressed)) < extOffset+numBytes {
-				return nil, fmt.Errorf("btrfs: decompressed extent too short (%d < %d) for inode %d at file offset %d",
-					len(decompressed), extOffset+numBytes, in.num, fileOffset)
+			// Validate the source window [extOffset, extOffset+numBytes) within
+			// the decompressed buffer (overflow-safe) before slicing.
+			if err := safeio.CheckBounds(int(extOffset), int(numBytes), len(decompressed)); err != nil {
+				return nil, fmt.Errorf("btrfs: decompressed extent too short for inode %d at file offset %d: %w",
+					in.num, fileOffset, err)
 			}
 			copy(out[fileOffset:fileOffset+numBytes], decompressed[extOffset:extOffset+numBytes])
 			// extentDataPrealloc: treat as zero/sparse.
 		}
 	}
 	return out, nil
+}
+
+// clampRAM bounds an attacker-controlled ram_bytes value to a hard ceiling
+// (maxDecompressRAM) and to a context-specific upper bound (the remaining
+// file bytes or the required window), defeating H4 where the decompression
+// "limit" is the attacker's own declared size.
+func clampRAM(ramBytes, contextMax uint64) uint64 {
+	if ramBytes > maxDecompressRAM {
+		ramBytes = maxDecompressRAM
+	}
+	if ramBytes > contextMax {
+		ramBytes = contextMax
+	}
+	return ramBytes
+}
+
+// decompressLimit turns a (possibly attacker-controlled) ram_bytes into a
+// safe io.LimitReader bound: ramBytes+1 (the +1 lets us detect a stream that
+// produces more than declared), clamped to maxDecompressRAM+1 so a value near
+// 2^64 cannot overflow the int64 limit or allow an unbounded read.
+func decompressLimit(ramBytes uint64) int64 {
+	if ramBytes > maxDecompressRAM {
+		ramBytes = maxDecompressRAM
+	}
+	return int64(ramBytes) + 1
 }
 
 // decompressExtent expands a compressed extent payload. When compression is
@@ -141,12 +203,9 @@ func decompressExtent(src []byte, compression uint8, ramBytes uint64) ([]byte, e
 		}
 		defer zr.Close()
 		// Cap reads at ramBytes + a small slack so a malformed stream cannot
-		// allocate unbounded memory.
-		limit := int64(ramBytes) + 1
-		if limit <= 0 {
-			limit = 1 << 30
-		}
-		out, err := io.ReadAll(io.LimitReader(zr, limit))
+		// allocate unbounded memory. ramBytes is clamped to the hard ceiling
+		// so a huge or overflowing declared size can't defeat the limit.
+		out, err := io.ReadAll(io.LimitReader(zr, decompressLimit(ramBytes)))
 		if err != nil {
 			return nil, fmt.Errorf("zlib decompress: %w", err)
 		}
@@ -170,11 +229,7 @@ func decompressZstd(src []byte, ramBytes uint64) ([]byte, error) {
 		return nil, fmt.Errorf("zstd reader: %w", err)
 	}
 	defer zr.Close()
-	limit := int64(ramBytes) + 1
-	if limit <= 0 {
-		limit = 1 << 30
-	}
-	out, err := io.ReadAll(io.LimitReader(zr, limit))
+	out, err := io.ReadAll(io.LimitReader(zr, decompressLimit(ramBytes)))
 	if err != nil {
 		return nil, fmt.Errorf("zstd decompress: %w", err)
 	}

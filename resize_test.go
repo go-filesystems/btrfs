@@ -426,10 +426,10 @@ func TestResize_StressCycleUnderReads(t *testing.T) {
 	defer cancel()
 
 	var (
-		readers       atomic.Uint64
-		resizes       atomic.Uint64
-		mismatchSeen  atomic.Uint64
-		wg            sync.WaitGroup
+		readers      atomic.Uint64
+		resizes      atomic.Uint64
+		mismatchSeen atomic.Uint64
+		wg           sync.WaitGroup
 	)
 
 	// Two readers.
@@ -661,5 +661,3 @@ func TestResize_ShrinkSyncFails(t *testing.T) {
 		t.Fatal("Shrink accepted despite Sync failure")
 	}
 }
-
-

@@ -119,8 +119,8 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	// btrfs_root_item layout: inode(160) + generation(8) + root_dirid(8) +
 	// bytenr(8) at offset 0xB0. resolveRootTree reads bytenr at 0xB0 so we
 	// must put it there.
-	le.PutUint64(rootItemData[0xA0:], 1)        // generation
-	le.PutUint64(rootItemData[0xA8:], 256)      // root_dirid (root inode obj ID)
+	le.PutUint64(rootItemData[0xA0:], 1)         // generation
+	le.PutUint64(rootItemData[0xA8:], 256)       // root_dirid (root inode obj ID)
 	le.PutUint64(rootItemData[0xB0:], fmtFSPhys) // root bytenr
 	_ = leafInsertItem(rootLeaf, key{fsTreeObjID, typeRootItem, 0}, rootItemData)
 	le.PutUint64(rootLeaf[0x50:], 1)

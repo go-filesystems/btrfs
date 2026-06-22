@@ -46,6 +46,11 @@ func decompressLzo(src []byte, ramBytes uint64) ([]byte, error) {
 	if limit == 0 {
 		limit = uint64(totalSize) * 16
 	}
+	// H4: ramBytes is fully attacker-controlled; clamp the output ceiling so
+	// a huge declared size cannot drive a multi-GiB make() up front.
+	if limit > maxDecompressRAM {
+		limit = maxDecompressRAM
+	}
 	out := make([]byte, 0, limit)
 
 	in := 4

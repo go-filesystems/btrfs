@@ -9,7 +9,13 @@ import (
 	"testing"
 )
 
-// ── gptPartOffset ─────────────────────────────────────────────────────────
+// ── partitionOffset: GPT path ─────────────────────────────────────────────
+//
+// partition.go now delegates parsing to the hardened go-volumes/gpt package;
+// these tests drive partitionOffset end-to-end (scheme auto-detection + the
+// btrfs-specific Linux-partition / bare-image fallback) over hand-built GPT
+// and MBR images. rwaBuf has no Size(), so deviceSize() falls back to the
+// 1 GiB hardSizeCeiling, against which every fixture partition validates.
 
 func buildGPTBuf(numParts uint32, entrySize uint32, linuxPart bool, partStartLBA uint64) *rwaBuf {
 	// Minimum size: 3 sectors (MBR + GPT header + entry table)
@@ -17,9 +23,10 @@ func buildGPTBuf(numParts uint32, entrySize uint32, linuxPart bool, partStartLBA
 	buf := &rwaBuf{data: make([]byte, size)}
 	le := binary.LittleEndian
 
-	// GPT header starts at byte 512
+	// GPT header starts at byte 512. The "EFI PART" signature is what
+	// partitionOffset uses to dispatch to the GPT parser.
 	hdr := make([]byte, 92)
-	copy(hdr[0:], []byte("EFI PART")) // magic (not read by gptPartOffset directly)
+	copy(hdr[0:], []byte("EFI PART"))
 	partEntryLBA := uint64(2)
 	le.PutUint64(hdr[72:], partEntryLBA)
 	le.PutUint32(hdr[80:], numParts)
@@ -30,7 +37,8 @@ func buildGPTBuf(numParts uint32, entrySize uint32, linuxPart bool, partStartLBA
 		return buf
 	}
 
-	// Write partition entries at sector 2
+	// Write partition entries at sector 2. endLBA (offset 40) is set so the
+	// partition is a single sector, keeping it within the device.
 	tableOff := int64(partEntryLBA) * sectorSize
 	entry := make([]byte, entrySize)
 	if linuxPart {
@@ -40,6 +48,7 @@ func buildGPTBuf(numParts uint32, entrySize uint32, linuxPart bool, partStartLBA
 		entry[0] = 0xFF
 	}
 	le.PutUint64(entry[32:], partStartLBA)
+	le.PutUint64(entry[40:], partStartLBA) // endLBA == startLBA: 1-sector part
 	_, _ = buf.WriteAt(entry, tableOff)
 	return buf
 }
@@ -47,9 +56,9 @@ func buildGPTBuf(numParts uint32, entrySize uint32, linuxPart bool, partStartLBA
 func TestGPTPartOffset_AutoSelectLinux(t *testing.T) {
 	const startLBA = 2048
 	buf := buildGPTBuf(1, 128, true, startLBA)
-	off, err := gptPartOffset(buf, -1)
+	off, err := partitionOffset(buf, -1)
 	if err != nil {
-		t.Fatalf("gptPartOffset auto: %v", err)
+		t.Fatalf("partitionOffset auto: %v", err)
 	}
 	if off != startLBA*sectorSize {
 		t.Fatalf("expected %d, got %d", startLBA*sectorSize, off)
@@ -59,9 +68,9 @@ func TestGPTPartOffset_AutoSelectLinux(t *testing.T) {
 func TestGPTPartOffset_ByIndex(t *testing.T) {
 	const startLBA = 4096
 	buf := buildGPTBuf(1, 128, false, startLBA)
-	off, err := gptPartOffset(buf, 0)
+	off, err := partitionOffset(buf, 0)
 	if err != nil {
-		t.Fatalf("gptPartOffset by index: %v", err)
+		t.Fatalf("partitionOffset by index: %v", err)
 	}
 	if off != startLBA*sectorSize {
 		t.Fatalf("expected %d, got %d", startLBA*sectorSize, off)
@@ -70,7 +79,7 @@ func TestGPTPartOffset_ByIndex(t *testing.T) {
 
 func TestGPTPartOffset_IndexNotFound(t *testing.T) {
 	buf := buildGPTBuf(1, 128, true, 2048)
-	_, err := gptPartOffset(buf, 5)
+	_, err := partitionOffset(buf, 5)
 	if err == nil {
 		t.Fatal("expected index-not-found error")
 	}
@@ -78,7 +87,7 @@ func TestGPTPartOffset_IndexNotFound(t *testing.T) {
 
 func TestGPTPartOffset_NoLinuxPartition(t *testing.T) {
 	buf := buildGPTBuf(1, 128, false, 2048)
-	_, err := gptPartOffset(buf, -1)
+	_, err := partitionOffset(buf, -1)
 	if err == nil {
 		t.Fatal("expected no-linux-partition error")
 	}
@@ -86,18 +95,9 @@ func TestGPTPartOffset_NoLinuxPartition(t *testing.T) {
 
 func TestGPTPartOffset_SmallEntrySize(t *testing.T) {
 	buf := buildGPTBuf(1, 64 /* < 128 */, true, 2048)
-	_, err := gptPartOffset(buf, -1)
+	_, err := partitionOffset(buf, -1)
 	if err == nil {
 		t.Fatal("expected small-entry-size error")
-	}
-}
-
-func TestGPTPartOffset_ReadHeaderError(t *testing.T) {
-	// Buffer with fewer than 512+92 bytes so ReadAt at 512 fails
-	buf := &rwaBuf{data: make([]byte, 100)}
-	_, err := gptPartOffset(buf, -1)
-	if err == nil {
-		t.Fatal("expected read error for short buffer")
 	}
 }
 
@@ -108,20 +108,21 @@ func TestGPTPartOffset_SkipsEmptyEntry(t *testing.T) {
 	le := binary.LittleEndian
 
 	hdr := make([]byte, 92)
+	copy(hdr[0:], []byte("EFI PART"))
 	le.PutUint64(hdr[72:], 2) // partEntryLBA
 	le.PutUint32(hdr[80:], 2) // numParts
 	le.PutUint32(hdr[84:], 128)
 	_, _ = buf.WriteAt(hdr, 512)
 
 	tableOff := int64(2 * sectorSize)
-	// Entry 0: all zeros = empty, skip
-	// Entry 1: Linux
+	// Entry 0: all zeros = empty, skip. Entry 1: Linux.
 	entry1 := make([]byte, 128)
 	copy(entry1[0:16], linuxPartTypeGPT[:])
 	le.PutUint64(entry1[32:], 2048)
+	le.PutUint64(entry1[40:], 2048)
 	_, _ = buf.WriteAt(entry1, tableOff+128)
 
-	off, err := gptPartOffset(buf, -1)
+	off, err := partitionOffset(buf, -1)
 	if err != nil {
 		t.Fatalf("expected success: %v", err)
 	}
@@ -130,22 +131,24 @@ func TestGPTPartOffset_SkipsEmptyEntry(t *testing.T) {
 	}
 }
 
-func TestGPTPartOffset_ReadEntryError(t *testing.T) {
-	// numParts=1 but buffer too short => ReadAt for entry fails => break => no linux partition
-	buf := &rwaBuf{data: make([]byte, 1024)} // too short for entry table
+func TestGPTPartOffset_EntryArrayOutOfRange(t *testing.T) {
+	// numParts=10 with partEntryLBA=2 but a tiny device => the entry array
+	// extent exceeds the device size and the hardened parser rejects it.
+	buf := &rwaBuf{data: make([]byte, 1024)}
 	le := binary.LittleEndian
 	hdr := make([]byte, 92)
+	copy(hdr[0:], []byte("EFI PART"))
 	le.PutUint64(hdr[72:], 2)   // partEntryLBA
-	le.PutUint32(hdr[80:], 10)  // 10 parts, but buffer too small
+	le.PutUint32(hdr[80:], 10)  // 10 parts
 	le.PutUint32(hdr[84:], 128) // entrySize
 	_, _ = buf.WriteAt(hdr, 512)
-	_, err := gptPartOffset(buf, -1)
+	_, err := partitionOffset(buf, -1)
 	if err == nil {
-		t.Fatal("expected error when entry table is unreadable")
+		t.Fatal("expected error when entry array exceeds the device")
 	}
 }
 
-// ── mbrPartOffset ─────────────────────────────────────────────────────────
+// ── partitionOffset: MBR path ─────────────────────────────────────────────
 
 func buildMBRBuf(ptype byte, startLBA uint32, magic bool) *rwaBuf {
 	buf := &rwaBuf{data: make([]byte, 512*4)}
@@ -154,20 +157,22 @@ func buildMBRBuf(ptype byte, startLBA uint32, magic bool) *rwaBuf {
 		buf.data[510] = 0x55
 		buf.data[511] = 0xAA
 	}
-	// Partition table at offset 446, entry 0
+	// Partition table at offset 446, entry 0. A 1-sector numSectors keeps the
+	// partition within the device for the hardened parser's range check.
 	e := make([]byte, 16)
 	e[4] = ptype
 	le.PutUint32(e[8:], startLBA)
+	le.PutUint32(e[12:], 1) // numSectors
 	_, _ = buf.WriteAt(e, 446)
 	return buf
 }
 
 func TestMBRPartOffset_AutoSelectLinux(t *testing.T) {
 	const startLBA = 2048
-	buf := buildMBRBuf(0x83, startLBA, false)
-	off, err := mbrPartOffset(buf, -1)
+	buf := buildMBRBuf(0x83, startLBA, true)
+	off, err := partitionOffset(buf, -1)
 	if err != nil {
-		t.Fatalf("mbrPartOffset auto: %v", err)
+		t.Fatalf("partitionOffset auto: %v", err)
 	}
 	if off != startLBA*sectorSize {
 		t.Fatalf("expected %d, got %d", startLBA*sectorSize, off)
@@ -176,10 +181,10 @@ func TestMBRPartOffset_AutoSelectLinux(t *testing.T) {
 
 func TestMBRPartOffset_ByIndex(t *testing.T) {
 	const startLBA = 2048
-	buf := buildMBRBuf(0x07, startLBA, false)
-	off, err := mbrPartOffset(buf, 0)
+	buf := buildMBRBuf(0x07, startLBA, true)
+	off, err := partitionOffset(buf, 0)
 	if err != nil {
-		t.Fatalf("mbrPartOffset by index: %v", err)
+		t.Fatalf("partitionOffset by index: %v", err)
 	}
 	if off != startLBA*sectorSize {
 		t.Fatalf("expected %d, got %d", startLBA*sectorSize, off)
@@ -187,36 +192,43 @@ func TestMBRPartOffset_ByIndex(t *testing.T) {
 }
 
 func TestMBRPartOffset_IndexNotFound(t *testing.T) {
-	buf := buildMBRBuf(0x83, 2048, false)
-	_, err := mbrPartOffset(buf, 3)
+	buf := buildMBRBuf(0x83, 2048, true)
+	_, err := partitionOffset(buf, 3)
 	if err == nil {
 		t.Fatal("expected index-not-found error")
 	}
 }
 
 func TestMBRPartOffset_NoLinuxPartition(t *testing.T) {
-	buf := buildMBRBuf(0x07, 2048, false)
-	_, err := mbrPartOffset(buf, -1)
+	buf := buildMBRBuf(0x07, 2048, true)
+	_, err := partitionOffset(buf, -1)
 	if err == nil {
 		t.Fatal("expected no-linux-partition error")
 	}
 }
 
-func TestMBRPartOffset_SkipsZeroStartLBA(t *testing.T) {
-	// startLBA=0 means "no partition", should skip it
-	buf := buildMBRBuf(0x83, 0, false) // startLBA=0, should be skipped
-	_, err := mbrPartOffset(buf, -1)
-	if err == nil {
-		t.Fatal("expected error (no valid partitions)")
+func TestPartOffset_BareImage(t *testing.T) {
+	// No "EFI PART" and no 0x55AA signature: a bare btrfs image whose
+	// filesystem starts at offset 0.
+	buf := &rwaBuf{data: make([]byte, 4096)}
+	off, err := partitionOffset(buf, -1)
+	if err != nil {
+		t.Fatalf("bare image auto: %v", err)
 	}
-}
-
-func TestMBRPartOffset_ReadError(t *testing.T) {
-	// Buffer too short to read from offset 446
-	buf := &rwaBuf{data: make([]byte, 100)}
-	_, err := mbrPartOffset(buf, -1)
-	if err == nil {
-		t.Fatal("expected read error for short buffer")
+	if off != 0 {
+		t.Fatalf("expected offset 0 for bare image, got %d", off)
+	}
+	// Index 0 on a bare image also means "the whole device".
+	off, err = partitionOffset(buf, 0)
+	if err != nil {
+		t.Fatalf("bare image index 0: %v", err)
+	}
+	if off != 0 {
+		t.Fatalf("expected offset 0 for bare image index 0, got %d", off)
+	}
+	// A non-zero index on a bare image has no partition table to satisfy it.
+	if _, err := partitionOffset(buf, 2); err == nil {
+		t.Fatal("expected error for non-zero index on bare image")
 	}
 }
 

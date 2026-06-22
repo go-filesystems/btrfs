@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/go-volumes/safeio"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,11 +125,23 @@ func findLeafContainingPrefix(r io.ReaderAt, partOff int64, sb *superblock,
 	type frame struct {
 		logAddr  uint64
 		startIdx int
+		depth    int
 	}
-	stack := []frame{{logAddr: rootLogAddr, startIdx: 0}}
+	var seen safeio.VisitSet
+	nodeGuard := safeio.NewLoopGuard(maxTreeNodes)
+	stack := []frame{{logAddr: rootLogAddr, startIdx: 0, depth: 0}}
 	for len(stack) > 0 {
 		top := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+		if top.depth > maxBtreeDepth {
+			return nil, 0, fmt.Errorf("btrfs: btree depth exceeds %d: %w", maxBtreeDepth, safeio.ErrLoopLimit)
+		}
+		if err := nodeGuard.Next(); err != nil {
+			return nil, 0, fmt.Errorf("btrfs: findLeafContainingPrefix: %w", err)
+		}
+		if err := seen.Check(top.logAddr); err != nil {
+			return nil, 0, fmt.Errorf("btrfs: findLeafContainingPrefix: %w", err)
+		}
 		buf, err := readNode(r, partOff, sb, top.logAddr)
 		if err != nil {
 			return nil, 0, err
@@ -161,7 +175,7 @@ func findLeafContainingPrefix(r io.ReaderAt, partOff int64, sb *superblock,
 			// target; the leftmost child whose first key precedes the target
 			// may still contain matching items, so include it.
 			childLog := le.Uint64(buf[off+17:])
-			stack = append(stack, frame{logAddr: childLog})
+			stack = append(stack, frame{logAddr: childLog, depth: top.depth + 1})
 		}
 	}
 	return nil, 0, nil
@@ -511,7 +525,14 @@ func cowInsertSplit(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *spa
 func tracePath(r io.ReaderAt, partOff int64, sb *superblock, rootLogAddr uint64, routeKey key) ([]pathEntry, error) {
 	var path []pathEntry
 	logAddr := rootLogAddr
-	for {
+	var seen safeio.VisitSet
+	for depth := 0; ; depth++ {
+		if depth > maxBtreeDepth {
+			return nil, fmt.Errorf("btrfs: btree depth exceeds %d: %w", maxBtreeDepth, safeio.ErrLoopLimit)
+		}
+		if err := seen.Check(logAddr); err != nil {
+			return nil, fmt.Errorf("btrfs: tracePath: %w", err)
+		}
 		buf, err := readNode(r, partOff, sb, logAddr)
 		if err != nil {
 			return nil, err

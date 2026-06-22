@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/go-volumes/safeio"
 )
 
 // loadChunkTree walks the chunk tree and merges all CHUNK_ITEM mappings into
@@ -56,16 +58,47 @@ func loadChunkTree(r io.ReaderAt, partOff int64, sb *superblock) error {
 }
 
 // walkLeaves walks every leaf in the tree rooted at rootLogAddr and calls fn
-// for each leaf's items.
+// for each leaf's items. This runs at mount time (loadChunkTree), so it is
+// pre-auth and must stay bounded against malicious chunk-tree geometry.
 func walkLeaves(r io.ReaderAt, partOff int64, sb *superblock,
 	rootLogAddr uint64, fn func(buf []byte, items []leafItem) error,
 ) error {
 	return walkNode(r, partOff, sb, rootLogAddr, fn)
 }
 
+// walkNode walks the subtree rooted at logAddr, calling fn for each leaf's
+// items, with its own cycle-detection set and node-count guard so a
+// self-referential or fan-out-bomb tree cannot recurse without bound or
+// revisit the same node forever.
 func walkNode(r io.ReaderAt, partOff int64, sb *superblock,
 	logAddr uint64, fn func(buf []byte, items []leafItem) error,
 ) error {
+	w := &treeWalk{
+		seen:  &safeio.VisitSet{},
+		guard: safeio.NewLoopGuard(maxTreeNodes),
+	}
+	return w.walkNode(r, partOff, sb, logAddr, 0, fn)
+}
+
+// treeWalk carries the cycle-detection set and node-count guard shared across
+// a single recursive chunk-tree walk.
+type treeWalk struct {
+	seen  *safeio.VisitSet
+	guard *safeio.LoopGuard
+}
+
+func (w *treeWalk) walkNode(r io.ReaderAt, partOff int64, sb *superblock,
+	logAddr uint64, depth int, fn func(buf []byte, items []leafItem) error,
+) error {
+	if depth > maxBtreeDepth {
+		return fmt.Errorf("btrfs: chunk-tree depth exceeds %d: %w", maxBtreeDepth, safeio.ErrLoopLimit)
+	}
+	if err := w.guard.Next(); err != nil {
+		return fmt.Errorf("btrfs: walkNode: %w", err)
+	}
+	if err := w.seen.Check(logAddr); err != nil {
+		return fmt.Errorf("btrfs: walkNode: %w", err)
+	}
 	buf, err := readNode(r, partOff, sb, logAddr)
 	if err != nil {
 		return err
@@ -81,7 +114,13 @@ func walkNode(r io.ReaderAt, partOff int64, sb *superblock,
 			break
 		}
 		child := le.Uint64(buf[off+17:])
-		if err := walkNode(r, partOff, sb, child, fn); err != nil {
+		// Logical address 0 is reserved in btrfs and never a real node
+		// pointer; a zeroed key-ptr (e.g. from a truncated/over-claimed
+		// nItems) must be skipped rather than followed into a bogus node.
+		if child == 0 {
+			continue
+		}
+		if err := w.walkNode(r, partOff, sb, child, depth+1, fn); err != nil {
 			return err
 		}
 	}

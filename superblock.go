@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/go-volumes/safeio"
 )
 
 // superblock holds the in-memory representation of the Btrfs superblock.
@@ -93,32 +95,32 @@ type chunkMapping struct {
 
 // Superblock field offsets (all LE).
 const (
-	sbfCsum                 = 0x00  // [32]byte
-	sbfUUID                 = 0x20  // [16]byte
-	sbfPhysAddr             = 0x30  // uint64
-	sbfFlags                = 0x38  // uint64
-	sbfMagic                = 0x40  // uint64
-	sbfGeneration           = 0x48  // uint64
-	sbfRootLogAddr          = 0x50  // uint64
-	sbfChunkLogAddr         = 0x58  // uint64
-	sbfLogLogAddr           = 0x60  // uint64
-	sbfTotalBytes           = 0x70  // uint64
-	sbfBytesUsed            = 0x78  // uint64
-	sbfRootDirObjID         = 0x80  // uint64
-	sbfNumDevices           = 0x88  // uint64
-	sbfSectorSize           = 0x90  // uint32
-	sbfNodeSize             = 0x94  // uint32
-	sbfLeafSize             = 0x98  // uint32
-	sbfStripeSize           = 0x9C  // uint32
-	sbfSysChunkArrSz        = 0xA0  // uint32
-	sbfChunkRootGeneration  = 0xA4  // uint64
-	sbfCompatFlags          = 0xAC  // uint64
-	sbfCompatROFlags        = 0xB4  // uint64
-	sbfIncompatFlags        = 0xBC  // uint64
-	sbfCsumType             = 0xC4  // uint16 (0 = CRC32C)
-	sbfDevItem              = 0xC9  // dev_item struct (98 bytes); devid is the first uint64 at offset 0xC9
-	sbfLabel                = 0x12B // [256]byte
-	sbfSysChunkArr          = 0x32B // starts here; length = sbfSysChunkArrSz
+	sbfCsum                = 0x00  // [32]byte
+	sbfUUID                = 0x20  // [16]byte
+	sbfPhysAddr            = 0x30  // uint64
+	sbfFlags               = 0x38  // uint64
+	sbfMagic               = 0x40  // uint64
+	sbfGeneration          = 0x48  // uint64
+	sbfRootLogAddr         = 0x50  // uint64
+	sbfChunkLogAddr        = 0x58  // uint64
+	sbfLogLogAddr          = 0x60  // uint64
+	sbfTotalBytes          = 0x70  // uint64
+	sbfBytesUsed           = 0x78  // uint64
+	sbfRootDirObjID        = 0x80  // uint64
+	sbfNumDevices          = 0x88  // uint64
+	sbfSectorSize          = 0x90  // uint32
+	sbfNodeSize            = 0x94  // uint32
+	sbfLeafSize            = 0x98  // uint32
+	sbfStripeSize          = 0x9C  // uint32
+	sbfSysChunkArrSz       = 0xA0  // uint32
+	sbfChunkRootGeneration = 0xA4  // uint64
+	sbfCompatFlags         = 0xAC  // uint64
+	sbfCompatROFlags       = 0xB4  // uint64
+	sbfIncompatFlags       = 0xBC  // uint64
+	sbfCsumType            = 0xC4  // uint16 (0 = CRC32C)
+	sbfDevItem             = 0xC9  // dev_item struct (98 bytes); devid is the first uint64 at offset 0xC9
+	sbfLabel               = 0x12B // [256]byte
+	sbfSysChunkArr         = 0x32B // starts here; length = sbfSysChunkArrSz
 )
 
 // Subset of incompat-feature bits we emit. MixedBackref is the baseline
@@ -186,10 +188,27 @@ func readSuperblock(r io.ReaderAt, partOff int64) (*superblock, error) {
 		return nil, fmt.Errorf("btrfs: invalid superblock geometry nodeSize=%d sectorSize=%d",
 			sb.nodeSize, sb.sectorSize)
 	}
+	// Validate node geometry before any nodeSize-driven allocation in
+	// readNode: nodeSize must be at least one header, at most maxNodeSize,
+	// and a whole multiple of sectorSize. An attacker-supplied nodeSize of 1
+	// (OOB on every node read) or 0xFFFFFFFF (4 GiB alloc) is rejected here.
+	if sb.nodeSize < nodeHdrSize || sb.nodeSize > maxNodeSize {
+		return nil, fmt.Errorf("btrfs: nodeSize %d out of range [%d,%d]",
+			sb.nodeSize, nodeHdrSize, maxNodeSize)
+	}
+	if sb.nodeSize%sb.sectorSize != 0 {
+		return nil, fmt.Errorf("btrfs: nodeSize %d not a multiple of sectorSize %d",
+			sb.nodeSize, sb.sectorSize)
+	}
 
-	// Parse sys_chunk_array.
+	// Parse sys_chunk_array. arrSz is an attacker-controlled uint32; slice it
+	// out of the fixed superblock buffer with an overflow-safe bounds check
+	// so a value such as 0xFFFFFFFF yields an error instead of a panic.
 	arrSz := int(le.Uint32(buf[sbfSysChunkArrSz:]))
-	arrBuf := buf[sbfSysChunkArr : sbfSysChunkArr+arrSz]
+	arrBuf, err := safeio.Slice(buf, sbfSysChunkArr, arrSz)
+	if err != nil {
+		return nil, fmt.Errorf("btrfs: sys_chunk_array size %d out of bounds: %w", arrSz, err)
+	}
 	chunks, err := parseSysChunkArray(le, arrBuf, sb.devID)
 	if err != nil {
 		return nil, fmt.Errorf("btrfs: parse sys_chunk_array: %w", err)

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/go-volumes/safeio"
 )
 
 // ErrNotFound is returned when a path component cannot be located.
@@ -107,7 +109,13 @@ func readNode(r io.ReaderAt, partOff int64, sb *superblock, logAddr uint64) ([]b
 	if err != nil {
 		return nil, err
 	}
-	buf := make([]byte, sb.nodeSize)
+	// sb.nodeSize is validated in readSuperblock to be within
+	// [nodeHdrSize, maxNodeSize] and a multiple of sectorSize, but allocate
+	// through MakeBytes anyway so this never trusts the field blindly.
+	buf, err := safeio.MakeBytes(int64(sb.nodeSize), maxNodeSize)
+	if err != nil {
+		return nil, fmt.Errorf("btrfs: node alloc (nodeSize=%d): %w", sb.nodeSize, err)
+	}
 	if _, err := r.ReadAt(buf, phys); err != nil {
 		return nil, fmt.Errorf("btrfs: read node at phys 0x%X: %w", phys, err)
 	}
@@ -121,12 +129,31 @@ func searchTree(r io.ReaderAt, partOff int64, sb *superblock,
 	rootLogAddr uint64, wantObjID uint64, wantType uint8, wantOffset uint64,
 ) ([]byte, leafItem, error) {
 	logAddr := rootLogAddr
-	for {
+	var seen safeio.VisitSet
+	prevLevel := -1 // level of the previously visited node (-1 = root, no parent)
+	for depth := 0; ; depth++ {
+		// Bound descent depth and reject a block pointer revisited within
+		// this walk (a self-referential / cyclic tree).
+		if depth > maxBtreeDepth {
+			return nil, leafItem{}, fmt.Errorf("btrfs: btree depth exceeds %d: %w",
+				maxBtreeDepth, safeio.ErrLoopLimit)
+		}
+		if err := seen.Check(logAddr); err != nil {
+			return nil, leafItem{}, fmt.Errorf("btrfs: searchTree: %w", err)
+		}
 		buf, err := readNode(r, partOff, sb, logAddr)
 		if err != nil {
 			return nil, leafItem{}, err
 		}
 		hdr := parseNodeHeader(buf)
+		// A child must sit exactly one level below its parent; anything else
+		// is a corrupt/forged pointer that could form a cycle or a sideways
+		// jump. (prevLevel < 0 at the root skips the check.)
+		if prevLevel >= 0 && int(hdr.level) != prevLevel-1 {
+			return nil, leafItem{}, fmt.Errorf("btrfs: searchTree: child level %d not %d below parent: %w",
+				hdr.level, 1, ErrNotFound)
+		}
+		prevLevel = int(hdr.level)
 		if hdr.level == 0 {
 			// Leaf node: linear scan for the key.
 			items := parseLeafItems(buf, hdr.nItems)
@@ -201,13 +228,27 @@ func walkPrefixLeaves(r io.ReaderAt, partOff int64, sb *superblock,
 ) error {
 	type frame struct {
 		logAddr uint64
+		depth   int
 	}
 	// Depth-first left-to-right traversal of all subtrees whose key range
-	// overlaps the prefix.
-	stack := []frame{{logAddr: rootLogAddr}}
+	// overlaps the prefix. A VisitSet rejects a block pointer that appears
+	// twice in the walk (cycle / fan-out bomb) and nodeGuard caps the total
+	// node count even when every id is distinct.
+	var seen safeio.VisitSet
+	nodeGuard := safeio.NewLoopGuard(maxTreeNodes)
+	stack := []frame{{logAddr: rootLogAddr, depth: 0}}
 	for len(stack) > 0 {
 		top := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+		if top.depth > maxBtreeDepth {
+			return fmt.Errorf("btrfs: btree depth exceeds %d: %w", maxBtreeDepth, safeio.ErrLoopLimit)
+		}
+		if err := nodeGuard.Next(); err != nil {
+			return fmt.Errorf("btrfs: walkPrefixLeaves: %w", err)
+		}
+		if err := seen.Check(top.logAddr); err != nil {
+			return fmt.Errorf("btrfs: walkPrefixLeaves: %w", err)
+		}
 		buf, err := readNode(r, partOff, sb, top.logAddr)
 		if err != nil {
 			return err
@@ -245,7 +286,7 @@ func walkPrefixLeaves(r io.ReaderAt, partOff int64, sb *superblock,
 			children = append(children, childLog)
 		}
 		for i := len(children) - 1; i >= 0; i-- {
-			stack = append(stack, frame{logAddr: children[i]})
+			stack = append(stack, frame{logAddr: children[i], depth: top.depth + 1})
 		}
 	}
 	return nil
@@ -262,12 +303,26 @@ func searchTreePrefix(r io.ReaderAt, partOff int64, sb *superblock,
 	rootLogAddr uint64, wantObjID uint64, wantType uint8,
 ) ([]byte, []leafItem, error) {
 	logAddr := rootLogAddr
-	for {
+	var seen safeio.VisitSet
+	prevLevel := -1
+	for depth := 0; ; depth++ {
+		if depth > maxBtreeDepth {
+			return nil, nil, fmt.Errorf("btrfs: btree depth exceeds %d: %w",
+				maxBtreeDepth, safeio.ErrLoopLimit)
+		}
+		if err := seen.Check(logAddr); err != nil {
+			return nil, nil, fmt.Errorf("btrfs: searchTreePrefix: %w", err)
+		}
 		buf, err := readNode(r, partOff, sb, logAddr)
 		if err != nil {
 			return nil, nil, err
 		}
 		hdr := parseNodeHeader(buf)
+		if prevLevel >= 0 && int(hdr.level) != prevLevel-1 {
+			return nil, nil, fmt.Errorf("btrfs: searchTreePrefix: child level %d invalid below parent level %d: %w",
+				hdr.level, prevLevel, ErrNotFound)
+		}
+		prevLevel = int(hdr.level)
 		if hdr.level == 0 {
 			items := parseLeafItems(buf, hdr.nItems)
 			var matched []leafItem

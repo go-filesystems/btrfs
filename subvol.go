@@ -7,6 +7,7 @@ import (
 	"os"
 
 	filesystem "github.com/go-filesystems/interface"
+	"github.com/go-volumes/safeio"
 )
 
 // Subvolume / snapshot READ support.
@@ -182,11 +183,29 @@ func enumerateSubvolumes(fs *btrfsFS) ([]Subvolume, error) {
 func walkAllLeaves(r io.ReaderAt, partOff int64, sb *superblock, rootLogAddr uint64,
 	visit func(buf []byte, it leafItem) bool,
 ) error {
-	stack := []uint64{rootLogAddr}
+	type frame struct {
+		logAddr uint64
+		depth   int
+	}
+	// Bound the ROOT_TREE walk: reject a revisited block pointer (cycle) and
+	// cap the total node count and depth so a forged tree cannot livelock or
+	// exhaust memory.
+	var seen safeio.VisitSet
+	nodeGuard := safeio.NewLoopGuard(maxTreeNodes)
+	stack := []frame{{logAddr: rootLogAddr, depth: 0}}
 	for len(stack) > 0 {
-		logAddr := stack[len(stack)-1]
+		top := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		buf, err := readNode(r, partOff, sb, logAddr)
+		if top.depth > maxBtreeDepth {
+			return fmt.Errorf("btrfs: ROOT_TREE depth exceeds %d: %w", maxBtreeDepth, safeio.ErrLoopLimit)
+		}
+		if err := nodeGuard.Next(); err != nil {
+			return fmt.Errorf("btrfs: walkAllLeaves: %w", err)
+		}
+		if err := seen.Check(top.logAddr); err != nil {
+			return fmt.Errorf("btrfs: walkAllLeaves: %w", err)
+		}
+		buf, err := readNode(r, partOff, sb, top.logAddr)
 		if err != nil {
 			return err
 		}
@@ -207,11 +226,13 @@ func walkAllLeaves(r io.ReaderAt, partOff int64, sb *superblock, rootLogAddr uin
 			if off+keyPtrSize > len(buf) {
 				break
 			}
-			children = append(children, le.Uint64(buf[off+17:]))
+			if child := le.Uint64(buf[off+17:]); child != 0 {
+				children = append(children, child)
+			}
 		}
 		// Push in reverse so the LIFO stack pops them left-to-right.
 		for i := len(children) - 1; i >= 0; i-- {
-			stack = append(stack, children[i])
+			stack = append(stack, frame{logAddr: children[i], depth: top.depth + 1})
 		}
 	}
 	return nil

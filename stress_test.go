@@ -20,6 +20,7 @@
 //	                        set to e.g. 1024 for GiB-scale streaming)
 //
 // CLI flags mirror the env vars (env wins when both are set):
+//
 //	-stress.workers      -stress.duration
 //	-stress.files        -stress.file-mb
 //
@@ -567,10 +568,10 @@ func (f *faultyBackend) WriteAt(p []byte, off int64) (int, error) {
 	return f.inner.WriteAt(p, off)
 }
 
-func (f *faultyBackend) Sync() error              { return f.inner.Sync() }
-func (f *faultyBackend) Size() (int64, error)     { return f.inner.Size() }
-func (f *faultyBackend) Truncate(s int64) error   { return f.inner.Truncate(s) }
-func (f *faultyBackend) Close() error             { return f.inner.Close() }
+func (f *faultyBackend) Sync() error            { return f.inner.Sync() }
+func (f *faultyBackend) Size() (int64, error)   { return f.inner.Size() }
+func (f *faultyBackend) Truncate(s int64) error { return f.inner.Truncate(s) }
+func (f *faultyBackend) Close() error           { return f.inner.Close() }
 
 // TestStress_FaultInjection wraps a real osFileBackend with a probabilistic
 // faulty backend, "arms" it once the filesystem is fully open, and runs a
@@ -944,4 +945,3 @@ func openRAIDImagesAsBackends(t *testing.T, paths []string) []BlockBackend {
 	}
 	return out
 }
-

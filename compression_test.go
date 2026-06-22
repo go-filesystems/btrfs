@@ -94,7 +94,7 @@ func TestZlib_ReadCompressedExtent(t *testing.T) {
 		logData,
 		uint64(len(compressed)), // disk_num_bytes (compressed size on disk)
 		uint64(len(payload)),    // ram_bytes (decompressed size)
-		0,                        // offset within the decompressed extent
+		0,                       // offset within the decompressed extent
 		uint64(len(payload)),    // num_bytes used from the decompressed extent
 		bf.sb.generation+1,
 		compressionZlib,
@@ -260,7 +260,7 @@ func TestLZO_RoundTrip(t *testing.T) {
 		{"medium", bytes.Repeat([]byte("ABCDEFGHIJKLMNOP"), 100)},                // 1600 bytes (one page)
 		{"two-pages", bytes.Repeat([]byte("0123456789abcdef"), 600)},             // 9600 bytes (3 segments)
 		{"exact-page", bytes.Repeat([]byte{'X'}, btrfsLzoPageSize)},              // exactly one page
-		{"page-plus-some", bytes.Repeat([]byte{'Y'}, btrfsLzoPageSize+50)},      // forces 2 segments (second segment >= 4 bytes)
+		{"page-plus-some", bytes.Repeat([]byte{'Y'}, btrfsLzoPageSize+50)},       // forces 2 segments (second segment >= 4 bytes)
 		{"large", bytes.Repeat([]byte("the quick brown fox jumps over "), 2000)}, // ~62 KiB
 	}
 	for _, tc := range cases {
@@ -324,7 +324,7 @@ func TestLZO_PageStraddleSkip(t *testing.T) {
 	// second segment's header within 3 bytes of the next page
 	// boundary. Our encoder handles the padding rule for us.
 	payload := append(
-		bytes.Repeat([]byte{'a'}, btrfsLzoPageSize),     // segment 1 (one page)
+		bytes.Repeat([]byte{'a'}, btrfsLzoPageSize),      // segment 1 (one page)
 		bytes.Repeat([]byte{'b'}, btrfsLzoPageSize/2)..., // segment 2
 	)
 	framed := btrfsLzoEncodeAllLiterals(payload)
@@ -370,8 +370,8 @@ func TestLZO_ZeroLengthSegment(t *testing.T) {
 	// total_size = 4 (header) + 4 (zero-len seg) + segment_for_payload.
 	payload := []byte("after-zero-segment-payload")
 	seg := lzo1xEncodeAllLiterals(payload)
-	buf := make([]byte, 4)                                                    // total_size placeholder
-	buf = append(buf, 0x00, 0x00, 0x00, 0x00)                                 // zero-length segment header
+	buf := make([]byte, 4)                    // total_size placeholder
+	buf = append(buf, 0x00, 0x00, 0x00, 0x00) // zero-length segment header
 	hdr := make([]byte, 4)
 	binary.LittleEndian.PutUint32(hdr, uint32(len(seg)))
 	buf = append(buf, hdr...)

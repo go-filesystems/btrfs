@@ -42,9 +42,9 @@ func (p *devicePool) addDevice(devID uint64, dev blockBackend) {
 	p.devices[devID] = dev
 }
 
-func (p *devicePool) Sync() error              { return p.primary.Sync() }
-func (p *devicePool) Size() (int64, error)     { return p.primary.Size() }
-func (p *devicePool) Truncate(s int64) error   { return p.primary.Truncate(s) }
+func (p *devicePool) Sync() error            { return p.primary.Sync() }
+func (p *devicePool) Size() (int64, error)   { return p.primary.Size() }
+func (p *devicePool) Truncate(s int64) error { return p.primary.Truncate(s) }
 func (p *devicePool) Close() error {
 	// Dedupe by backend pointer: the legacy compat aliases the primary
 	// under multiple devid keys (e.g. devid=0 and devid=1 for hand-built

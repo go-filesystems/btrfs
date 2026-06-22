@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/go-volumes/safeio"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,7 +92,29 @@ func (sm *spaceManager) reserveTreeNodes(r io.ReaderAt, partOff int64, sb *super
 }
 
 // walkNodeAddrs calls fn for every node logical address reachable from root.
+// This runs at mount time (buildSpaceManager), so it is pre-auth and bounded
+// against cyclic / unbounded-depth tree geometry.
 func walkNodeAddrs(r io.ReaderAt, partOff int64, sb *superblock, logAddr uint64, fn func(uint64) error) error {
+	w := &addrWalk{seen: &safeio.VisitSet{}, guard: safeio.NewLoopGuard(maxTreeNodes)}
+	return w.walk(r, partOff, sb, logAddr, 0, fn)
+}
+
+type addrWalk struct {
+	seen  *safeio.VisitSet
+	guard *safeio.LoopGuard
+}
+
+func (w *addrWalk) walk(r io.ReaderAt, partOff int64, sb *superblock, logAddr uint64, depth int, fn func(uint64) error) error {
+	if depth > maxBtreeDepth {
+		return fmt.Errorf("btrfs: tree depth exceeds %d: %w", maxBtreeDepth, safeio.ErrLoopLimit)
+	}
+	if err := w.guard.Next(); err != nil {
+		return fmt.Errorf("btrfs: walkNodeAddrs: %w", err)
+	}
+	// A cycle would re-reserve the same nodes endlessly; stop on revisit.
+	if !w.seen.Add(logAddr) {
+		return nil
+	}
 	if err := fn(logAddr); err != nil {
 		return err
 	}
@@ -109,7 +133,10 @@ func walkNodeAddrs(r io.ReaderAt, partOff int64, sb *superblock, logAddr uint64,
 			break
 		}
 		childLog := le.Uint64(buf[off+17:])
-		if err := walkNodeAddrs(r, partOff, sb, childLog, fn); err != nil {
+		if childLog == 0 {
+			continue // logical 0 is reserved; never a real node pointer
+		}
+		if err := w.walk(r, partOff, sb, childLog, depth+1, fn); err != nil {
 			return err
 		}
 	}

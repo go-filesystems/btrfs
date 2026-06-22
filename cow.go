@@ -132,24 +132,47 @@ func leafInsertItem(leafBuf []byte, k key, data []byte) error {
 		return fmt.Errorf("%w (need %d, have %d free)", errLeafFull, needed, free)
 	}
 
-	// Shift item descriptors right to make room.
-	copy(leafBuf[nodeHdrSize+(insertIdx+1)*itemSize:],
-		leafBuf[nodeHdrSize+insertIdx*itemSize:nodeHdrSize+n*itemSize])
-
-	// New data goes just below the existing data area; existing data need not move.
-	newDataOff := dataAreaEnd - len(data)
-
-	// Write new item descriptor.
-	descOff := nodeHdrSize + insertIdx*itemSize
 	le := binary.LittleEndian
-	le.PutUint64(leafBuf[descOff:], k.objID)
-	leafBuf[descOff+8] = k.typ
-	le.PutUint64(leafBuf[descOff+9:], k.offset)
-	le.PutUint32(leafBuf[descOff+17:], uint32(newDataOff-nodeHdrSize))
-	le.PutUint32(leafBuf[descOff+21:], uint32(len(data)))
 
-	// Write new item data.
-	copy(leafBuf[newDataOff:], data)
+	// Snapshot the existing items' (key, data) before we overwrite descriptors,
+	// so we can rebuild the leaf with its data area tightly packed in descriptor
+	// order. The Linux kernel's leaf validator requires
+	// item[i].offset + item[i].size == item[i-1].offset (data contiguous and in
+	// reverse descriptor order); the previous in-place insert left a hole when
+	// inserting in the middle, which the kernel rejects as "unexpected item end".
+	type itemRec struct {
+		k    key
+		data []byte
+	}
+	recs := make([]itemRec, 0, n+1)
+	for i := 0; i < n; i++ {
+		off := nodeHdrSize + i*itemSize
+		ik := readKey(leafBuf[off:])
+		dOff := nodeHdrSize + int(le.Uint32(leafBuf[off+17:]))
+		dSize := int(le.Uint32(leafBuf[off+21:]))
+		d := make([]byte, dSize)
+		copy(d, leafBuf[dOff:dOff+dSize])
+		recs = append(recs, itemRec{ik, d})
+	}
+	// Insert the new record at the sorted position.
+	nd := make([]byte, len(data))
+	copy(nd, data)
+	recs = append(recs, itemRec{})
+	copy(recs[insertIdx+1:], recs[insertIdx:])
+	recs[insertIdx] = itemRec{k, nd}
+
+	// Rewrite all descriptors and pack data from the end of the node backwards.
+	dataCursor := nodeSize
+	for i, r := range recs {
+		dataCursor -= len(r.data)
+		copy(leafBuf[dataCursor:], r.data)
+		descOff := nodeHdrSize + i*itemSize
+		le.PutUint64(leafBuf[descOff:], r.k.objID)
+		leafBuf[descOff+8] = r.k.typ
+		le.PutUint64(leafBuf[descOff+9:], r.k.offset)
+		le.PutUint32(leafBuf[descOff+17:], uint32(dataCursor-nodeHdrSize))
+		le.PutUint32(leafBuf[descOff+21:], uint32(len(r.data)))
+	}
 
 	// Bump nritems.
 	le.PutUint32(leafBuf[0x60:], uint32(n+1))

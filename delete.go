@@ -73,7 +73,10 @@ func unlinkInodeOnly(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 	}
 	*fsTreeRoot = newRoot
 
-	// Parent contents shrank by one entry — bump its mtime/ctime.
+	// Parent contents shrank by one entry — shrink its i_size and bump mtime/ctime.
+	if err := adjustDirSize(rwaAt, rws, partOff, sb, sm, fsTreeRoot, parentIno, -dirEntrySizeDelta(name)); err != nil {
+		return fmt.Errorf("btrfs unlink: shrink parent size: %w", err)
+	}
 	if err := touchDir(rwaAt, rws, partOff, sb, sm, fsTreeRoot, parentIno); err != nil {
 		return fmt.Errorf("btrfs unlink: touch parent: %w", err)
 	}
@@ -125,11 +128,10 @@ func deleteDir(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 		return fmt.Errorf("btrfs deletedir: remove dot entries: %w", err)
 	}
 	*fsTreeRoot = newRoot
-	if err := removeInode(rwaAt, rws, partOff, sb, sm, fsTreeRoot, childObjID, parentIno, name); err != nil {
-		return err
-	}
-	// The disappearing subdirectory's "..": one fewer link to the parent.
-	return adjustDirNlink(rwaAt, rws, partOff, sb, sm, fsTreeRoot, parentIno, -1)
+	// btrfs keeps every directory at i_nlink == 1 (subdirectories are not counted
+	// in the parent's link count, and the kernel rejects nlink > 1 on a dir), so
+	// removing a subdirectory must NOT change the parent's nlink — only its size.
+	return removeInode(rwaAt, rws, partOff, sb, sm, fsTreeRoot, childObjID, parentIno, name)
 }
 
 // purgeDirContents recursively removes all files and subdirectories inside the

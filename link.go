@@ -84,5 +84,10 @@ func linkInode(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 	}
 	*fsTreeRoot = newRoot
 
+	// The new hard link added an entry to the destination parent — grow its size.
+	if err := adjustDirSize(rwaAt, rws, partOff, sb, sm, fsTreeRoot, newParentIno, dirEntrySizeDelta(newName)); err != nil {
+		return fmt.Errorf("btrfs link: grow parent size: %w", err)
+	}
+
 	return updateFsTreeRoot(rwaAt, partOff, sb, sm, *fsTreeRoot)
 }

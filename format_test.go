@@ -276,3 +276,46 @@ func TestBtrfsFmt_OpenFSFails(t *testing.T) {
 	t.Cleanup(func() { btrfsFormatOpenFS = old })
 	btrfsExpectBoom(t)
 }
+
+// TestComputeLayout_ScalesWithImageSize verifies the on-disk chunk geometry
+// chosen for both large images (canonical 4 MiB SYSTEM + remainder DATA) and
+// small images (SYSTEM shrunk to one stripe-len). All chunks must be
+// stripe-len-aligned and physically fit within the device.
+func TestComputeLayout_ScalesWithImageSize(t *testing.T) {
+	cases := []struct {
+		name     string
+		size     uint64
+		wantSys  uint64
+		dataBlks uint64 // minimum data blocks that must fit
+	}{
+		{"128MiB", 128 << 20, 4 << 20, fmtDataBlocks},
+		{"16MiB", 16 << 20, 4 << 20, fmtDataBlocks},
+		{"small", fmtSysChunkLogical + 2*fmtStripeLen, fmtStripeLen, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := computeLayout(tc.size)
+			if l.sysChunkLen != tc.wantSys {
+				t.Errorf("sysChunkLen = %d, want %d", l.sysChunkLen, tc.wantSys)
+			}
+			if l.sysChunkLogical != fmtSysChunkLogical {
+				t.Errorf("sysChunkLogical = %#x, want %#x", l.sysChunkLogical, fmtSysChunkLogical)
+			}
+			if l.dataChunkLogical != fmtSysChunkLogical+l.sysChunkLen {
+				t.Errorf("dataChunkLogical = %#x, want %#x", l.dataChunkLogical, fmtSysChunkLogical+l.sysChunkLen)
+			}
+			if l.sysChunkLen%fmtStripeLen != 0 || l.dataChunkLen%fmtStripeLen != 0 {
+				t.Errorf("chunk lengths not stripe-aligned: sys=%d data=%d", l.sysChunkLen, l.dataChunkLen)
+			}
+			if end := l.dataChunkLogical + l.dataChunkLen; end > tc.size {
+				t.Errorf("data chunk end %#x exceeds image size %#x", end, tc.size)
+			}
+			if l.dataChunkLen < tc.dataBlks*fmtNodeSize {
+				t.Errorf("data chunk %d too small for %d blocks", l.dataChunkLen, tc.dataBlks)
+			}
+			if l.devBytesUsed != l.sysChunkLen+l.dataChunkLen {
+				t.Errorf("devBytesUsed = %d, want %d", l.devBytesUsed, l.sysChunkLen+l.dataChunkLen)
+			}
+		})
+	}
+}

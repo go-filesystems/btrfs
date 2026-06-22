@@ -253,25 +253,36 @@ func (fs *btrfsFS) tailChunkIdxLocked(endPhys uint64) (int, error) {
 // primary superblock when one is present for that key. Caller must hold
 // fs.mu.
 func (fs *btrfsFS) rewriteChunkSizeLocked(logStart, newSize uint64) error {
-	// (a) Chunk tree update via COW. CHUNK_ITEM key: (1, 0xE4, logStart).
-	leafBuf, item, err := searchTree(fs.f, fs.partOffset, fs.sb, fs.sb.chunkLogAddr, 1, 0xE4, logStart)
+	// (a) Chunk tree update — IN PLACE. The chunk tree lives in the SYSTEM chunk
+	// (the only chunk the superblock's sys_chunk_array maps), so it must NOT be
+	// COW-relocated: the space manager only allocates from DATA|METADATA chunks,
+	// and a relocated chunk-tree node would land in a chunk that is itself only
+	// described inside the chunk tree — unreachable at the next mount. We instead
+	// rewrite the CHUNK_ITEM's size field in the existing single-leaf chunk tree
+	// and refresh its CRC. CHUNK_ITEM key:
+	// (FIRST_CHUNK_TREE_OBJECTID, CHUNK_ITEM, logStart).
+	phys, err := fs.sb.physAddr(fs.partOffset, fs.sb.chunkLogAddr)
 	if err != nil {
-		return fmt.Errorf("locate CHUNK_ITEM %d: %w", logStart, err)
+		return fmt.Errorf("locate chunk tree node: %w", err)
 	}
-	data := item.data(leafBuf)
-	if len(data) < chunkHeaderSize {
-		return fmt.Errorf("CHUNK_ITEM payload too short (%d bytes)", len(data))
+	leafBuf := make([]byte, fs.sb.nodeSize)
+	if _, err := fs.rwa.ReadAt(leafBuf, phys); err != nil {
+		return fmt.Errorf("read chunk tree node: %w", err)
 	}
-	newData := make([]byte, len(data))
-	copy(newData, data)
-	binary.LittleEndian.PutUint64(newData[chunkSize:], newSize)
-
-	newRoot, err := cowUpdate(fs.rwa, fs.rwa, fs.partOffset, fs.sb, fs.sm, fs.sb.chunkLogAddr,
-		key{1, 0xE4, logStart}, newData)
-	if err != nil {
-		return fmt.Errorf("cow update CHUNK_ITEM: %w", err)
+	idx := findItemIdx(leafBuf, firstChunkTreeObjID, typeChunkItem, logStart)
+	if idx < 0 {
+		return fmt.Errorf("locate CHUNK_ITEM %d: not in chunk tree leaf", logStart)
 	}
-	fs.sb.chunkLogAddr = newRoot
+	items := parseLeafItems(leafBuf, parseNodeHeader(leafBuf).nItems)
+	d := items[idx].data(leafBuf)
+	if len(d) < chunkHeaderSize {
+		return fmt.Errorf("CHUNK_ITEM payload too short (%d bytes)", len(d))
+	}
+	binary.LittleEndian.PutUint64(d[chunkSize:], newSize)
+	updateNodeCRC(leafBuf)
+	if _, err := fs.rwa.WriteAt(leafBuf, phys); err != nil {
+		return fmt.Errorf("write chunk tree node: %w", err)
+	}
 
 	// (b) sys_chunk_array embedded copy. Only present for SYSTEM chunks and
 	// for chunks Format() writes into the array (its single chunk has
@@ -306,7 +317,7 @@ func (fs *btrfsFS) rewriteSysChunkArrayEntryLocked(logStart, newSize uint64) err
 		if off+entryLen > len(arr) {
 			break
 		}
-		if keyType == 0xE4 && keyOff == logStart {
+		if keyType == typeChunkItem && keyOff == logStart {
 			le.PutUint64(arr[chunkBase+chunkSize:], newSize)
 			// Persist with refreshed CRC.
 			updateSuperblockCRC(buf)

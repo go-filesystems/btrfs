@@ -17,7 +17,7 @@ func readDirNlink(t *testing.T, fs *btrfsFS, ino uint64) uint32 {
 	return binary.LittleEndian.Uint32(d[inodeOffNLink:])
 }
 
-func TestDirNlink_RootStartsAtTwo(t *testing.T) {
+func TestDirNlink_RootStartsAtOne(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.img")
 	fs, err := Format(path, btrfsTestSize, FormatConfig{})
 	if err != nil {
@@ -25,12 +25,14 @@ func TestDirNlink_RootStartsAtTwo(t *testing.T) {
 	}
 	defer fs.Close()
 	bf := fs.(*btrfsFS)
-	if got := readDirNlink(t, bf, rootDirObjID); got != 2 {
-		t.Errorf("freshly formatted root nlink = %d, want 2", got)
+	// btrfs: an empty directory has nlink=1 (the kernel's tree-checker rejects
+	// nlink>1 for a dir with no subdirectories).
+	if got := readDirNlink(t, bf, rootDirObjID); got != 1 {
+		t.Errorf("freshly formatted root nlink = %d, want 1", got)
 	}
 }
 
-func TestDirNlink_NewSubdirHasTwo(t *testing.T) {
+func TestDirNlink_NewSubdirHasOne(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.img")
 	fs, err := Format(path, btrfsTestSize, FormatConfig{})
 	if err != nil {
@@ -46,12 +48,19 @@ func TestDirNlink_NewSubdirHasTwo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat /d: %v", err)
 	}
-	if got := readDirNlink(t, bf, st.Inode()); got != 2 {
-		t.Errorf("new empty subdir nlink = %d, want 2", got)
+	// btrfs: a new empty subdirectory has nlink=1.
+	if got := readDirNlink(t, bf, st.Inode()); got != 1 {
+		t.Errorf("new empty subdir nlink = %d, want 1", got)
 	}
 }
 
-func TestDirNlink_ParentBumpsOnMkDir(t *testing.T) {
+// btrfs keeps every directory at nlink == 1 regardless of how many
+// subdirectories it holds — unlike traditional Unix filesystems, subdirectories
+// are NOT counted in the parent's link count, and the kernel's tree-checker
+// rejects any directory whose nlink exceeds 1 ("invalid nlink: has 2 expect no
+// more than 1 for dir"). These tests pin that invariant so the regression that
+// made our images unmountable cannot reappear.
+func TestDirNlink_ParentStaysOneOnMkDir(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.img")
 	fs, err := Format(path, btrfsTestSize, FormatConfig{})
 	if err != nil {
@@ -60,26 +69,23 @@ func TestDirNlink_ParentBumpsOnMkDir(t *testing.T) {
 	defer fs.Close()
 	bf := fs.(*btrfsFS)
 
-	before := readDirNlink(t, bf, rootDirObjID)
 	if err := fs.MkDir("/sub", 0o755); err != nil {
 		t.Fatalf("MkDir: %v", err)
 	}
-	after := readDirNlink(t, bf, rootDirObjID)
-	if after != before+1 {
-		t.Errorf("root nlink: before=%d after=%d, want +1", before, after)
+	if got := readDirNlink(t, bf, rootDirObjID); got != 1 {
+		t.Errorf("root nlink after MkDir = %d, want 1 (btrfs dirs never exceed 1)", got)
 	}
 
-	// A second sibling subdir adds one more.
+	// A second sibling subdir still leaves the parent at 1.
 	if err := fs.MkDir("/sub2", 0o755); err != nil {
 		t.Fatalf("MkDir sub2: %v", err)
 	}
-	after2 := readDirNlink(t, bf, rootDirObjID)
-	if after2 != after+1 {
-		t.Errorf("root nlink after 2nd sub: before=%d after=%d, want +1", after, after2)
+	if got := readDirNlink(t, bf, rootDirObjID); got != 1 {
+		t.Errorf("root nlink after 2nd subdir = %d, want 1", got)
 	}
 }
 
-func TestDirNlink_ParentDecrementsOnDeleteDir(t *testing.T) {
+func TestDirNlink_ParentStaysOneOnDeleteDir(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.img")
 	fs, err := Format(path, btrfsTestSize, FormatConfig{})
 	if err != nil {
@@ -91,17 +97,15 @@ func TestDirNlink_ParentDecrementsOnDeleteDir(t *testing.T) {
 	if err := fs.MkDir("/temp", 0o755); err != nil {
 		t.Fatalf("MkDir: %v", err)
 	}
-	withSub := readDirNlink(t, bf, rootDirObjID)
 	if err := fs.DeleteDir("/temp"); err != nil {
 		t.Fatalf("DeleteDir: %v", err)
 	}
-	after := readDirNlink(t, bf, rootDirObjID)
-	if after != withSub-1 {
-		t.Errorf("root nlink: before delete=%d after=%d, want -1", withSub, after)
+	if got := readDirNlink(t, bf, rootDirObjID); got != 1 {
+		t.Errorf("root nlink after DeleteDir = %d, want 1", got)
 	}
 }
 
-func TestDirNlink_NestedDirs(t *testing.T) {
+func TestDirNlink_NestedDirsStayOne(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.img")
 	fs, err := Format(path, btrfsTestSize, FormatConfig{})
 	if err != nil {
@@ -115,29 +119,26 @@ func TestDirNlink_NestedDirs(t *testing.T) {
 	}
 	stOuter, _ := fs.Stat("/outer")
 	outerIno := stOuter.Inode()
-	beforeInner := readDirNlink(t, bf, outerIno)
-	if beforeInner != 2 {
-		t.Fatalf("outer dir start nlink = %d, want 2", beforeInner)
+	if got := readDirNlink(t, bf, outerIno); got != 1 {
+		t.Fatalf("outer dir start nlink = %d, want 1", got)
 	}
 
-	// Add three subdirs to /outer. Each must bump /outer's nlink by 1.
+	// Adding subdirs must NOT change /outer's nlink (stays 1).
 	for _, name := range []string{"/outer/a", "/outer/b", "/outer/c"} {
 		if err := fs.MkDir(name, 0o755); err != nil {
 			t.Fatalf("MkDir %q: %v", name, err)
 		}
 	}
-	got := readDirNlink(t, bf, outerIno)
-	if got != beforeInner+3 {
-		t.Errorf("outer nlink after 3 subdirs = %d, want %d", got, beforeInner+3)
+	if got := readDirNlink(t, bf, outerIno); got != 1 {
+		t.Errorf("outer nlink after 3 subdirs = %d, want 1", got)
 	}
 
-	// And deleting one drops it back by 1.
+	// And deleting one still leaves it at 1.
 	if err := fs.DeleteDir("/outer/b"); err != nil {
 		t.Fatalf("DeleteDir: %v", err)
 	}
-	got2 := readDirNlink(t, bf, outerIno)
-	if got2 != got-1 {
-		t.Errorf("outer nlink after deleting one subdir = %d, want %d", got2, got-1)
+	if got := readDirNlink(t, bf, outerIno); got != 1 {
+		t.Errorf("outer nlink after deleting one subdir = %d, want 1", got)
 	}
 }
 

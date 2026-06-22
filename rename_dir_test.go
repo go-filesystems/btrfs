@@ -1,24 +1,21 @@
 package filesystem_btrfs
 
 import (
-	"encoding/binary"
 	"path/filepath"
 	"testing"
 )
 
-// readDotDotInodeNum returns the inode number that the ".." DIR_INDEX entry
-// inside the directory `dirIno` resolves to.
+// readDotDotInodeNum returns a directory's parent inode number. btrfs records
+// the parent in the directory's INODE_REF item, whose key OFFSET is the parent
+// inode number (key = {dirIno, INODE_REF, parentIno}). There is no stored ".."
+// directory entry.
 func readDotDotInodeNum(t *testing.T, fs *btrfsFS, dirIno uint64) uint64 {
 	t.Helper()
-	buf, it, err := searchTree(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, dirIno, typeDirIndex, 2)
-	if err != nil {
-		t.Fatalf("searchTree DIR_INDEX 2 of dir inode %d: %v", dirIno, err)
+	items, err := collectPrefixItems(fs.f, fs.partOffset, fs.sb, fs.fsTreeRoot, dirIno, typeInodeRef)
+	if err != nil || len(items) == 0 {
+		t.Fatalf("collect INODE_REF of dir inode %d: %v", dirIno, err)
 	}
-	d := it.data(buf)
-	if len(d) < dirItemHdrSize {
-		t.Fatalf("DIR_INDEX 2 data too short: %d", len(d))
-	}
-	return binary.LittleEndian.Uint64(d[0:])
+	return items[0].k.offset
 }
 
 func TestRenameDir_CrossParentUpdatesDotDot(t *testing.T) {
@@ -58,7 +55,11 @@ func TestRenameDir_CrossParentUpdatesDotDot(t *testing.T) {
 	}
 }
 
-func TestRenameDir_CrossParentShiftsNlink(t *testing.T) {
+// btrfs counts no subdirectory links in a directory's nlink (every dir stays at
+// 1, and the kernel rejects nlink > 1), so even a cross-parent directory move
+// leaves both parents' nlink unchanged — the moved dir's parent link is recorded
+// solely by its INODE_REF.
+func TestRenameDir_CrossParentKeepsNlinkOne(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.img")
 	fs, err := Format(path, btrfsTestSize, FormatConfig{})
 	if err != nil {
@@ -78,20 +79,16 @@ func TestRenameDir_CrossParentShiftsNlink(t *testing.T) {
 	}
 	stSrc, _ := fs.Stat("/src")
 	stDst, _ := fs.Stat("/dst")
-	srcBefore := readDirNlink(t, bf, stSrc.Inode())
-	dstBefore := readDirNlink(t, bf, stDst.Inode())
 
 	if err := fs.Rename("/src/d", "/dst/d"); err != nil {
 		t.Fatalf("Rename: %v", err)
 	}
 
-	srcAfter := readDirNlink(t, bf, stSrc.Inode())
-	dstAfter := readDirNlink(t, bf, stDst.Inode())
-	if srcAfter != srcBefore-1 {
-		t.Errorf("src parent nlink: was %d, now %d, want %d", srcBefore, srcAfter, srcBefore-1)
+	if got := readDirNlink(t, bf, stSrc.Inode()); got != 1 {
+		t.Errorf("src parent nlink after cross-parent move = %d, want 1", got)
 	}
-	if dstAfter != dstBefore+1 {
-		t.Errorf("dst parent nlink: was %d, now %d, want %d", dstBefore, dstAfter, dstBefore+1)
+	if got := readDirNlink(t, bf, stDst.Inode()); got != 1 {
+		t.Errorf("dst parent nlink after cross-parent move = %d, want 1", got)
 	}
 }
 

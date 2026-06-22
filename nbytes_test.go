@@ -21,7 +21,7 @@ func readInodeNBytes(t *testing.T, fs *btrfsFS, ino uint64) uint64 {
 	return binary.LittleEndian.Uint64(d[inodeOffNBytes:])
 }
 
-func TestNBytes_InlineIsZero(t *testing.T) {
+func TestNBytes_InlineIsRamBytes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.img")
 	fs, err := Format(path, btrfsTestSize, FormatConfig{})
 	if err != nil {
@@ -30,15 +30,18 @@ func TestNBytes_InlineIsZero(t *testing.T) {
 	defer fs.Close()
 	bf := fs.(*btrfsFS)
 
-	if err := fs.WriteFile("/inline.txt", []byte("tiny payload"), 0o644); err != nil {
+	const payload = "tiny payload"
+	if err := fs.WriteFile("/inline.txt", []byte(payload), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	st, err := fs.Stat("/inline.txt")
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	if got := readInodeNBytes(t, bf, st.Inode()); got != 0 {
-		t.Fatalf("inline file nbytes = %d, want 0", got)
+	// btrfs: an inline file's nbytes equals the inline data's ram_bytes (its
+	// uncompressed length), so `btrfs check` does not flag "nbytes wrong".
+	if got := readInodeNBytes(t, bf, st.Inode()); got != uint64(len(payload)) {
+		t.Fatalf("inline file nbytes = %d, want %d", got, len(payload))
 	}
 }
 
@@ -117,11 +120,13 @@ func TestNBytes_RefreshesOnOverwrite(t *testing.T) {
 		t.Fatalf("after regular write: nbytes = 0, expected non-zero")
 	}
 
-	// Overwrite with tiny inline payload — nbytes must reset to 0.
-	if err := fs.WriteFile("/morphing.bin", []byte("now tiny"), 0o644); err != nil {
+	// Overwrite with tiny inline payload — nbytes resets to the inline ram_bytes
+	// (the uncompressed length), matching what `btrfs check` expects.
+	const tiny = "now tiny"
+	if err := fs.WriteFile("/morphing.bin", []byte(tiny), 0o644); err != nil {
 		t.Fatalf("WriteFile v2: %v", err)
 	}
-	if got := readInodeNBytes(t, bf, ino); got != 0 {
-		t.Fatalf("after overwrite to inline: nbytes = %d, want 0", got)
+	if got := readInodeNBytes(t, bf, ino); got != uint64(len(tiny)) {
+		t.Fatalf("after overwrite to inline: nbytes = %d, want %d", got, len(tiny))
 	}
 }

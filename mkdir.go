@@ -26,23 +26,15 @@ func makeDir(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 	ino, _ := nextInodeNum(rwaAt, partOff, sb, *fsTreeRoot)
 	generation := sb.generation + 1
 	mode := uint16(0o040000 | (perm & 0o777))
-	// Fresh dir has nlink=2: the entry in the parent + the "." self-reference.
-	inodeBuf := encodeInodeItem(ino, 0, mode, generation, 0, 2)
+	// A fresh btrfs directory has nlink=1 (an empty dir links only via its own
+	// entry); each child SUBDIR later bumps it by one. btrfs does NOT store
+	// "."/".." as DIR_INDEX/DIR_ITEM entries — those are implicit, and the
+	// kernel's tree-checker rejects them (name-hash mismatch). The parent link
+	// is recorded by the INODE_REF inserted below.
+	inodeBuf := encodeInodeItem(ino, 0, mode, generation, 0, 1)
 	newRoot, err := cowInsert(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, key{ino, typeInodeItem, 0}, inodeBuf)
 	if err != nil {
 		return fmt.Errorf("btrfs mkdir: insert inode: %w", err)
-	}
-	*fsTreeRoot = newRoot
-	dotBuf := encodeDirItem(ino, typeInodeItem, ftDir, ".")
-	dotdotBuf := encodeDirItem(parentIno, typeInodeItem, ftDir, "..")
-	newRoot, err = cowInsert(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, key{ino, typeDirIndex, 1}, dotBuf)
-	if err != nil {
-		return fmt.Errorf("btrfs mkdir: insert '.': %w", err)
-	}
-	*fsTreeRoot = newRoot
-	newRoot, err = cowInsert(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, key{ino, typeDirIndex, 2}, dotdotBuf)
-	if err != nil {
-		return fmt.Errorf("btrfs mkdir: insert '..': %w", err)
 	}
 	*fsTreeRoot = newRoot
 	idxOff := nextDirIndexOffset(rwaAt, partOff, sb, *fsTreeRoot, parentIno)
@@ -65,9 +57,19 @@ func makeDir(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 		return fmt.Errorf("btrfs mkdir: insert inode ref: %w", err)
 	}
 	*fsTreeRoot = newRoot
-	// The new subdir's ".." entry counts as an additional link to the parent.
-	if err := adjustDirNlink(rwaAt, rws, partOff, sb, sm, fsTreeRoot, parentIno, +1); err != nil {
-		return fmt.Errorf("btrfs mkdir: bump parent nlink: %w", err)
+	// The new subdir adds an entry to the parent (grow its i_size). Unlike
+	// traditional Unix filesystems, btrfs does NOT count subdirectories in a
+	// directory's nlink: every directory inode keeps i_nlink == 1, and the
+	// kernel's tree-checker rejects any directory with nlink > 1
+	// ("invalid nlink: has 2 expect no more than 1 for dir"). So the parent's
+	// nlink is left unchanged here.
+	if err := adjustDirSize(rwaAt, rws, partOff, sb, sm, fsTreeRoot, parentIno, dirEntrySizeDelta(name)); err != nil {
+		return fmt.Errorf("btrfs mkdir: grow parent size: %w", err)
+	}
+	// Adding a child changes the parent directory: bump its mtime/ctime (without
+	// touching its nlink, which btrfs keeps at 1).
+	if err := touchDir(rwaAt, rws, partOff, sb, sm, fsTreeRoot, parentIno); err != nil {
+		return fmt.Errorf("btrfs mkdir: touch parent: %w", err)
 	}
 	return updateFsTreeRoot(rwaAt, partOff, sb, sm, *fsTreeRoot)
 }

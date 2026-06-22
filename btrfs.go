@@ -30,21 +30,44 @@ const (
 	// B-tree node header magic (v2 csum-enabled).
 	nodeHeaderMagic uint32 = 0xEB176CBA
 
-	// Well-known object IDs.
-	rootTreeObjID  uint64 = 1
-	chunkTreeObjID uint64 = 3
-	fsTreeObjID    uint64 = 5
+	// Well-known object IDs (tree objectids and special keys).
+	rootTreeObjID   uint64 = 1
+	extentTreeObjID uint64 = 2
+	chunkTreeObjID  uint64 = 3
+	devTreeObjID    uint64 = 4
+	fsTreeObjID     uint64 = 5
+	csumTreeObjID   uint64 = 7
+	uuidTreeObjID   uint64 = 9
+	// dataRelocTreeObjID is BTRFS_DATA_RELOC_TREE_OBJECTID (-9 as a signed
+	// objectid). open_ctree's btrfs_read_roots requires this root to exist
+	// (btrfs_get_fs_root(DATA_RELOC, true) returns -ENOENT otherwise, which the
+	// kernel misreports as "failed to read root (objectid=4)").
+	dataRelocTreeObjID  uint64 = 0xFFFFFFFFFFFFFFF7
+	devItemsObjID       uint64 = 1   // BTRFS_DEV_ITEMS_OBJECTID
+	firstChunkTreeObjID uint64 = 256 // BTRFS_FIRST_CHUNK_TREE_OBJECTID
+	devStatsObjID       uint64 = 0   // BTRFS_DEV_STATS_OBJECTID
 
 	rootDirObjID uint64 = 256 // BTRFS_FIRST_FREE_OBJECTID
 
 	// Item type codes.
-	typeInodeItem  uint8 = 0x01
-	typeInodeRef   uint8 = 0x0C
-	typeXattrItem  uint8 = 0x18
-	typeDirItem    uint8 = 0x54
-	typeDirIndex   uint8 = 0x60
-	typeExtentData uint8 = 0x6C
-	typeRootItem   uint8 = 0x84
+	typeInodeItem      uint8 = 0x01
+	typePersistentItem uint8 = 0xF9 // BTRFS_PERSISTENT_ITEM_KEY (DEV_STATS uses this)
+	typeInodeRef       uint8 = 0x0C
+	typeXattrItem      uint8 = 0x18
+	typeDirItem        uint8 = 0x54
+	typeDirIndex       uint8 = 0x60
+	typeExtentData     uint8 = 0x6C
+	typeRootItem       uint8 = 0x84
+	typeExtentItem     uint8 = 0xA8
+	typeMetadataItem   uint8 = 0xA9
+	typeTreeBlockRef   uint8 = 0xB0
+	typeBlockGroupItem uint8 = 0xC0
+	typeDevExtent      uint8 = 0xCC
+	typeDevItem        uint8 = 0xD8
+	typeChunkItem      uint8 = 0xE4
+
+	// extent_item flags.
+	extentFlagTreeBlock uint64 = 1 << 1 // BTRFS_EXTENT_FLAG_TREE_BLOCK
 
 	// DirItem file type values.
 	ftUnknown uint8 = 0

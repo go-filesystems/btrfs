@@ -45,6 +45,10 @@ func buildSubvolFixture(t *testing.T) string {
 	for i := range uuid {
 		uuid[i] = byte(i + 1)
 	}
+	var devUUID [16]byte
+	for i := range devUUID {
+		devUUID[i] = byte(0x80 + i)
+	}
 
 	buildEmptyLeaf := func(physAddr uint64) []byte {
 		buf := make([]byte, fmtNodeSize)
@@ -71,9 +75,31 @@ func buildSubvolFixture(t *testing.T) string {
 		return rinode
 	}
 
+	// svtChunkItem builds a single SYSTEM chunk that maps the whole fixture
+	// image 1:1 (logical 0 .. svtImageSize -> physical 0). The fixture keeps the
+	// pre-2-chunk single-SYSTEM-chunk layout, so it supplies its own chunk item
+	// covering all of its node addresses (0x20000..0x24000) rather than Format's
+	// 0x100000-based mixed layout.
+	svtChunkItem := func() []byte {
+		item := make([]byte, chunkHeaderSize+chunkStripeSize)
+		le.PutUint64(item[chunkSize:], svtImageSize)
+		le.PutUint64(item[chunkRootObjID:], extentTreeObjID)
+		le.PutUint64(item[chunkStripeLen:], fmtStripeLen)
+		le.PutUint64(item[chunkType:], blockGroupSystem)
+		le.PutUint32(item[chunkOptIOAlign:], fmtNodeSize)
+		le.PutUint32(item[chunkOptIOWidth:], fmtNodeSize)
+		le.PutUint32(item[chunkMinIOSize:], fmtNodeSize)
+		le.PutUint16(item[chunkNumStripes:], 1)
+		le.PutUint16(item[chunkSubStripes:], 1)
+		le.PutUint64(item[chunkStripeDevID:], 1)
+		le.PutUint64(item[chunkStripeOffset:], 0)
+		copy(item[chunkStripeDevUUID:], devUUID[:])
+		return item
+	}
+
 	// ── Chunk tree leaf ─────────────────────────────────────────────────────
 	chunkLeaf := buildEmptyLeaf(svtChunkPhys)
-	_ = leafInsertItem(chunkLeaf, key{1, 0xE4, 0}, buildSysChunkItemBytes(le, svtImageSize))
+	_ = leafInsertItem(chunkLeaf, key{firstChunkTreeObjID, typeChunkItem, 0}, svtChunkItem())
 	updateNodeCRC(chunkLeaf)
 
 	// ── Default FS_TREE leaf (id 5): just the root dir ──────────────────────
@@ -165,10 +191,25 @@ func buildSubvolFixture(t *testing.T) string {
 	_ = leafInsertItem(rootLeaf, key{fsTreeObjID, typeRootRef, svtSubvolID}, rref)
 	updateNodeCRC(rootLeaf)
 
-	// ── Superblock (reuse Format's builder; point root tree at our root leaf) ─
-	sb := buildSuperblockBytes(le, uuid, "subvoltest", svtImageSize)
+	// ── Superblock (reuse Format's builder; point root/chunk trees at our leaves
+	// and override the sys_chunk_array with the fixture's whole-image chunk) ──
+	sb := buildSuperblockBytes(le, uuid, devUUID, "subvoltest", svtImageSize, computeLayout(svtImageSize))
 	le.PutUint64(sb[sbfRootLogAddr:], svtRootPhys)
 	le.PutUint64(sb[sbfChunkLogAddr:], svtChunkPhys)
+	{
+		k := make([]byte, keySize)
+		le.PutUint64(k[0:], firstChunkTreeObjID)
+		k[8] = typeChunkItem
+		le.PutUint64(k[9:], 0)
+		entry := append(k, svtChunkItem()...)
+		// Clear any leftover bytes from Format's longer sys_chunk_array, then
+		// write the fixture's single entry.
+		for i := sbfSysChunkArr; i < sbfSysChunkArr+0x800 && i < len(sb); i++ {
+			sb[i] = 0
+		}
+		copy(sb[sbfSysChunkArr:], entry)
+		le.PutUint32(sb[sbfSysChunkArrSz:], uint32(len(entry)))
+	}
 	updateSuperblockCRC(sb)
 
 	// ── Assemble and write the image file ───────────────────────────────────

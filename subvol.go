@@ -40,10 +40,11 @@ const (
 	lastFreeObjID  uint64 = 0xFFFFFFFFFFFFFF00 // BTRFS_LAST_FREE_OBJECTID
 
 	// btrfs_root_item field offsets we read.
-	rootItemOffGeneration = 0xA0 // __le64 generation
-	rootItemOffRootDirID  = 0xA8 // __le64 root_dirid
-	rootItemOffBytenr     = 0xB0 // __le64 bytenr (root node logical addr)
-	rootItemMinSize       = rootItemOffBytenr + 8
+	rootItemOffGeneration   = 0xA0 // __le64 generation
+	rootItemOffRootDirID    = 0xA8 // __le64 root_dirid
+	rootItemOffBytenr       = 0xB0 // __le64 bytenr (root node logical addr)
+	rootItemOffGenerationV2 = 0xEF // __le64 generation_v2 (must equal generation)
+	rootItemMinSize         = rootItemOffBytenr + 8
 
 	// btrfs_root_ref layout: dirid(8) + sequence(8) + name_len(2) + name.
 	rootRefHdrSize = 18

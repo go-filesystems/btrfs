@@ -100,26 +100,22 @@ func renameEntry(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 		return fmt.Errorf("btrfs rename: %w", err)
 	}
 
-	// Cross-parent directory move: the moved dir's ".." entry has to point
-	// at its new parent, and the two parents' nlink counts shift by one
-	// (the disappearing subdir's ".." back-reference moves with it).
-	if srcFtype == ftDir && oldParentIno != newParentIno {
-		newDotDot := encodeDirItem(newParentIno, typeInodeItem, ftDir, "..")
-		newRoot, err = cowUpdate(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, key{srcObjID, typeDirIndex, 2}, newDotDot)
-		if err != nil {
-			return fmt.Errorf("btrfs rename: update '..' entry of moved dir: %w", err)
-		}
-		*fsTreeRoot = newRoot
-		if err := adjustDirNlink(rwaAt, rws, partOff, sb, sm, fsTreeRoot, oldParentIno, -1); err != nil {
-			return fmt.Errorf("btrfs rename: decrement old parent nlink: %w", err)
-		}
-		if err := adjustDirNlink(rwaAt, rws, partOff, sb, sm, fsTreeRoot, newParentIno, +1); err != nil {
-			return fmt.Errorf("btrfs rename: bump new parent nlink: %w", err)
-		}
-	} else {
-		// Whatever shape the rename had, the source parent lost an entry
-		// (and gained one if same parent) — touch its mtime/ctime. Cross-
-		// parent dir moves already bumped both parents via adjustDirNlink.
+	// Maintain parent directory i_size: oldParent lost oldName, newParent gained
+	// newName (these are the same inode when the rename stays in one directory).
+	if err := adjustDirSize(rwaAt, rws, partOff, sb, sm, fsTreeRoot, oldParentIno, -dirEntrySizeDelta(oldName)); err != nil {
+		return fmt.Errorf("btrfs rename: shrink src parent size: %w", err)
+	}
+	if err := adjustDirSize(rwaAt, rws, partOff, sb, sm, fsTreeRoot, newParentIno, dirEntrySizeDelta(newName)); err != nil {
+		return fmt.Errorf("btrfs rename: grow dst parent size: %w", err)
+	}
+
+	// btrfs keeps every directory at i_nlink == 1: subdirectories are not counted
+	// in a parent's link count (and the kernel's tree-checker rejects nlink > 1 on
+	// a directory), so even a cross-parent directory move leaves both parents'
+	// nlink unchanged. The moved dir's parent link is recorded solely by its
+	// INODE_REF (already repointed at newParent above). We only touch the parents'
+	// timestamps to reflect the entry add/remove.
+	{
 		if err := touchDir(rwaAt, rws, partOff, sb, sm, fsTreeRoot, oldParentIno); err != nil {
 			return fmt.Errorf("btrfs rename: touch src parent: %w", err)
 		}

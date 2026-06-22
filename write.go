@@ -70,8 +70,14 @@ func nextDirIndexOffset(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot
 	return max + 1
 }
 
+// hashDirName computes the btrfs directory-entry name hash used as the offset
+// of DIR_ITEM / DIR_INDEX-paired DIR_ITEM keys. It matches the kernel's
+// btrfs_name_hash(): the standard reflected CRC32c framing seeded at 1 with a
+// final inversion, i.e. crc32c_raw(seed=1, name) ^ 0xFFFFFFFF. (Using a bare
+// crc32c update with seed 0xFFFFFFFF/0xFFFFFFFE produces a different value that
+// the kernel's tree-checker rejects as "name hash mismatch with key".)
 func hashDirName(name string) uint64 {
-	return uint64(crc32cSum([]byte(name), 0xFFFFFFFF))
+	return uint64(crc32cSum([]byte(name), 1) ^ 0xFFFFFFFF)
 }
 
 func encodeDirItem(locationObjID uint64, locationTyp uint8, ftype uint8, name string) []byte {
@@ -237,8 +243,14 @@ func encodeInodeItem(ino uint64, size uint64, mode uint16, generation uint64, nb
 // always 0 for inline and sparse).
 func classifyExtent(data []byte, sectorSize uint64) (extType uint8, nbytes uint64) {
 	const maxInlineSize = 2048
-	if len(data) == 0 || len(data) <= maxInlineSize {
+	if len(data) == 0 {
 		return extentDataInline, 0
+	}
+	if len(data) <= maxInlineSize {
+		// btrfs sets an inline file's inode.nbytes to the inline data's
+		// ram_bytes (the uncompressed length, NOT sector-aligned). `btrfs check`
+		// flags "nbytes wrong" when this is left at 0.
+		return extentDataInline, uint64(len(data))
 	}
 	if isAllZero(data) {
 		return extentDataRegular, 0
@@ -318,6 +330,41 @@ func touchDir(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 	sb *superblock, sm *spaceManager, fsTreeRoot *uint64, dirIno uint64,
 ) error {
 	return adjustDirNlink(rwaAt, rws, partOff, sb, sm, fsTreeRoot, dirIno, 0)
+}
+
+// dirEntrySizeDelta is the amount a directory's i_size changes when an entry of
+// the given name is added (positive) — btrfs counts each entry's name length
+// twice (once for its DIR_ITEM, once for its DIR_INDEX). `btrfs check` flags
+// "dir isize wrong" when this is not maintained.
+func dirEntrySizeDelta(name string) int64 { return 2 * int64(len(name)) }
+
+// adjustDirSize applies delta (which may be negative) to a directory inode's
+// i_size field, clamping at 0, and cowUpdates it back. Caller passes
+// dirEntrySizeDelta(name) when adding an entry and its negation when removing.
+func adjustDirSize(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
+	sb *superblock, sm *spaceManager, fsTreeRoot *uint64, dirIno uint64, delta int64,
+) error {
+	if delta == 0 {
+		return nil
+	}
+	buf, it, err := searchTree(rwaAt, partOff, sb, *fsTreeRoot, dirIno, typeInodeItem, 0)
+	if err != nil {
+		return fmt.Errorf("read dir inode %d for size: %w", dirIno, err)
+	}
+	d := make([]byte, it.dataSize)
+	copy(d, it.data(buf))
+	le := binary.LittleEndian
+	cur := int64(le.Uint64(d[inodeOffSize:])) + delta
+	if cur < 0 {
+		cur = 0
+	}
+	le.PutUint64(d[inodeOffSize:], uint64(cur))
+	newRoot, err := cowUpdate(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, key{dirIno, typeInodeItem, 0}, d)
+	if err != nil {
+		return fmt.Errorf("update dir inode %d size: %w", dirIno, err)
+	}
+	*fsTreeRoot = newRoot
+	return nil
 }
 
 // writeExtents writes the file body for inode ino as one or more EXTENT_DATA
@@ -455,7 +502,11 @@ func createInodeWithDirEntry(rwaAt readerWriterAt, rws readerWriterAt, partOff i
 		return fmt.Errorf("btrfs %s: insert inode ref: %w", opLabel, err)
 	}
 	*fsTreeRoot = newRoot
-	// Adding a child changes the parent's contents — bump its mtime/ctime.
+	// Adding a child changes the parent's contents — grow its i_size by the
+	// btrfs per-entry amount and bump its mtime/ctime.
+	if err := adjustDirSize(rwaAt, rws, partOff, sb, sm, fsTreeRoot, parentIno, dirEntrySizeDelta(name)); err != nil {
+		return fmt.Errorf("btrfs %s: grow parent size: %w", opLabel, err)
+	}
 	if err := touchDir(rwaAt, rws, partOff, sb, sm, fsTreeRoot, parentIno); err != nil {
 		return fmt.Errorf("btrfs %s: touch parent: %w", opLabel, err)
 	}
@@ -558,13 +609,26 @@ func updateFsTreeRoot(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *s
 	if err == nil {
 		d := make([]byte, it.dataSize)
 		copy(d, it.data(leafBuf))
-		// btrfs_root_item: bytenr at 0xB0, generation at 0xA0.
+		// btrfs_root_item: bytenr at 0xB0, generation at 0xA0. generation_v2
+		// (0xEF) must track generation or the kernel warns "mismatching
+		// generation and generation_v2" and resets the new fields on mount.
 		binary.LittleEndian.PutUint64(d[0xB0:], newFsRoot)
-		binary.LittleEndian.PutUint64(d[0xA0:], sb.generation+1)
+		binary.LittleEndian.PutUint64(d[rootItemOffGeneration:], sb.generation+1)
+		if len(d) > rootItemOffGenerationV2+8 {
+			binary.LittleEndian.PutUint64(d[rootItemOffGenerationV2:], sb.generation+1)
+		}
 		newRootRoot, rerr := cowUpdate(nil, rwaAt, partOff, sb, sm, sb.rootLogAddr, key{fsTreeObjID, typeRootItem, 0}, d)
 		if rerr == nil {
 			sb.rootLogAddr = newRootRoot
 		}
+	}
+	// Recompute the EXTENT_TREE so it exactly describes the live tree blocks and
+	// data extents after this transaction's COW churn. Done before writing the
+	// superblock so bytes_used and the extent tree commit together. Best-effort:
+	// a rebuild error leaves the prior extent tree in place (still mountable),
+	// so we surface it but do not abort the user's already-applied write.
+	if rebErr := rebuildExtentTree(rwaAt, partOff, sb, sm); rebErr != nil {
+		return fmt.Errorf("btrfs: rebuild extent tree: %w", rebErr)
 	}
 	return writeSuperblock(rwaAt, partOff, sb, newFsRoot)
 }

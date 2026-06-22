@@ -220,8 +220,12 @@ func TestResize_GrowAllowsAdditionalWrites(t *testing.T) {
 }
 
 func TestResize_ShrinkEmptyTail(t *testing.T) {
-	const size = 6 * 1024 * 1024
-	const newSize = 4 * 1024 * 1024
+	// The DATA|METADATA chunk starts at 5 MiB (after the 4 MiB SYSTEM chunk), so
+	// the new size must stay above that and the trimmed tail must be free. Use a
+	// 16 MiB image shrunk to 12 MiB: the [12,16) MiB tail of the data chunk is
+	// empty on a freshly-formatted image.
+	const size = 16 * 1024 * 1024
+	const newSize = 12 * 1024 * 1024
 	fs, path := resizeTempImage(t, size)
 
 	if err := fs.Shrink(newSize); err != nil {
@@ -280,8 +284,8 @@ func TestResize_ResizeDispatcher_GrowDirection(t *testing.T) {
 }
 
 func TestResize_ResizeDispatcher_ShrinkDirection(t *testing.T) {
-	const size = 6 * 1024 * 1024
-	const newSize = 4 * 1024 * 1024
+	const size = 16 * 1024 * 1024
+	const newSize = 12 * 1024 * 1024
 	fs, _ := resizeTempImage(t, size)
 	if err := fs.Resize(newSize); err != nil {
 		t.Fatalf("Resize(shrink direction): %v", err)
@@ -607,11 +611,11 @@ func TestResize_GrowTruncateFails(t *testing.T) {
 }
 
 func TestResize_ShrinkTruncateFails(t *testing.T) {
-	fs, fb := resizeWithFailingBackend(t, 6*1024*1024)
+	fs, fb := resizeWithFailingBackend(t, 16*1024*1024)
 	fb.failTruncate = true
-	// Try to shrink to 4 MiB — empty tail (no writes yet) so we'll get
-	// past the validation and reach the Truncate call.
-	if err := fs.Shrink(4 * 1024 * 1024); err == nil {
+	// Try to shrink to 12 MiB — empty tail (no writes yet) and above the data
+	// chunk start, so we get past validation and reach the Truncate call.
+	if err := fs.Shrink(12 * 1024 * 1024); err == nil {
 		t.Fatal("Shrink accepted despite Truncate failure")
 	} else if !strings.Contains(err.Error(), "truncate") {
 		t.Errorf("expected truncate error, got: %v", err)

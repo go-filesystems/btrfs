@@ -34,8 +34,8 @@ func TestExtendedStat_FreshFile(t *testing.T) {
 	if st.NLink != 1 {
 		t.Errorf("NLink = %d, want 1", st.NLink)
 	}
-	if st.NBytes != 0 {
-		t.Errorf("NBytes = %d, want 0 (inline)", st.NBytes)
+	if st.NBytes != 5 {
+		t.Errorf("NBytes = %d, want 5 (inline ram_bytes)", st.NBytes)
 	}
 	if st.Mode&0o777 != 0o644 {
 		t.Errorf("Mode perm bits = 0o%o, want 0o644", st.Mode&0o777)
@@ -62,7 +62,7 @@ func TestExtendedStat_FreshFile(t *testing.T) {
 	}
 }
 
-func TestExtendedStat_DirHasNlinkTwo(t *testing.T) {
+func TestExtendedStat_DirHasNlinkOne(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.img")
 	fs, err := Format(path, btrfsTestSize, FormatConfig{})
 	if err != nil {
@@ -80,8 +80,8 @@ func TestExtendedStat_DirHasNlinkTwo(t *testing.T) {
 	if !st.IsDir() {
 		t.Errorf("IsDir() false; mode = 0x%04x", st.Mode)
 	}
-	if st.NLink != 2 {
-		t.Errorf("NLink = %d, want 2 for empty dir", st.NLink)
+	if st.NLink != 1 {
+		t.Errorf("NLink = %d, want 1 for empty dir (btrfs convention)", st.NLink)
 	}
 }
 

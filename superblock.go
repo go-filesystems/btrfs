@@ -121,12 +121,25 @@ const (
 	sbfDevItem             = 0xC9  // dev_item struct (98 bytes); devid is the first uint64 at offset 0xC9
 	sbfLabel               = 0x12B // [256]byte
 	sbfSysChunkArr         = 0x32B // starts here; length = sbfSysChunkArrSz
+	sbfRootBackups         = 0xB2B // root_backups[4], each rootBackupSize bytes
 )
+
+// rootBackupSize is sizeof(struct btrfs_root_backup) = 168 bytes.
+const rootBackupSize = 168
 
 // Subset of incompat-feature bits we emit. MixedBackref is the baseline
 // modern-format bit; mkfs.btrfs has set it on every image since ~2008.
 const (
-	incompatMixedBackref uint64 = 1 << 0
+	incompatMixedBackref   uint64 = 1 << 0 // 0x001
+	incompatMixedGroups    uint64 = 1 << 2 // 0x004
+	incompatExtendedIRef   uint64 = 1 << 6 // 0x040
+	incompatSkinnyMetadata uint64 = 1 << 8 // 0x100
+	incompatNoHoles        uint64 = 1 << 9 // 0x200
+
+	// incompatMixedFlags matches a real `mkfs.btrfs --mixed` image (0x345):
+	// MIXED_BACKREF | MIXED_GROUPS | EXTENDED_IREF | SKINNY_METADATA | NO_HOLES.
+	incompatMixedFlags = incompatMixedBackref | incompatMixedGroups |
+		incompatExtendedIRef | incompatSkinnyMetadata | incompatNoHoles
 )
 
 // CRC32C is the only checksum we produce; this maps to csum_type 0.

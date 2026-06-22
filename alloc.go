@@ -48,10 +48,15 @@ type spaceManager struct {
 func buildSpaceManager(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint64) (*spaceManager, error) {
 	sm := &spaceManager{nodeSize: sb.nodeSize}
 
-	// Step 1: seed with DATA chunks.
+	// Step 1: seed with DATA / METADATA chunks. SYSTEM-only chunks are excluded:
+	// they hold the chunk tree and must not be handed out for file data or new
+	// metadata, or the block-group `used` accounting and the kernel's chunk
+	// validation break. (Pre-2-chunk images had a single all-covering chunk with
+	// type 0, which has neither bit set, so they are still seeded.)
 	for _, m := range sb.sysChunks {
-		// Only DATA chunks (type & 0x01 == DATA).
-		// We include all chunks since SYSTEM/METADATA also supply node space.
+		if m.profile&blockGroupSystem != 0 && m.profile&(blockGroupData|blockGroupMeta) == 0 {
+			continue
+		}
 		sm.freeExts = append(sm.freeExts, freeExtent{
 			physStart: m.physStart,
 			size:      m.size,
@@ -71,12 +76,44 @@ func buildSpaceManager(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot 
 	_ = sm.reserveTreeNodes(r, partOff, sb, sb.chunkLogAddr)
 	_ = sm.reserveTreeNodes(r, partOff, sb, fsTreeRoot)
 
+	// Step 3b: reserve the root node of every other tree the ROOT_TREE points
+	// at (EXTENT, DEV, CSUM, UUID, ...). These trees are referenced by ROOT_ITEM
+	// — not by node pointers — so reserveTreeNodes(rootLogAddr) above does not
+	// reach them. Without this, the COW allocator would hand out an extent/dev/
+	// csum/uuid block for new file data or metadata and corrupt the image (the
+	// kernel then fails open_ctree with a parent-transid mismatch on that block).
+	_ = sm.reserveRootTreeReferencedTrees(r, partOff, sb)
+
 	// Step 4: remove data extents used by files.
 	if err := sm.reserveDataExtents(r, partOff, sb, fsTreeRoot); err != nil {
 		return nil, fmt.Errorf("btrfs alloc: reserve data extents: %w", err)
 	}
 
 	return sm, nil
+}
+
+// reserveRootTreeReferencedTrees scans the ROOT_TREE for ROOT_ITEMs and
+// reserves every referenced tree's blocks. A ROOT_ITEM's bytenr (logical addr
+// of the tree's root node) lives at offset rootItemOffBytenr (0xB0). Each such
+// tree is then walked so multi-node trees are fully reserved.
+func (sm *spaceManager) reserveRootTreeReferencedTrees(r io.ReaderAt, partOff int64, sb *superblock) error {
+	return walkLeaves(r, partOff, sb, sb.rootLogAddr, func(buf []byte, items []leafItem) error {
+		for _, it := range items {
+			if it.k.typ != typeRootItem {
+				continue
+			}
+			d := it.data(buf)
+			if len(d) < rootItemOffBytenr+8 {
+				continue
+			}
+			bytenr := binary.LittleEndian.Uint64(d[rootItemOffBytenr:])
+			if bytenr == 0 {
+				continue
+			}
+			_ = sm.reserveTreeNodes(r, partOff, sb, bytenr)
+		}
+		return nil
+	})
 }
 
 // reserveTreeNodes walks every node of a tree and marks its physical block as used.

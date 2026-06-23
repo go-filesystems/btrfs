@@ -260,6 +260,14 @@ func removeInode(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 		*fsTreeRoot = newRoot
 	}
 
+	// Parent contents shrank by one entry — shrink its i_size by the same
+	// btrfs per-entry amount the matching insert added (dirEntrySizeDelta:
+	// name_len counted once for the DIR_ITEM and once for the DIR_INDEX).
+	// Omitting this leaves the parent's i_size too large and makes
+	// `btrfs check` report "dir isize wrong".
+	if err := adjustDirSize(rwaAt, rws, partOff, sb, sm, fsTreeRoot, parentIno, -dirEntrySizeDelta(name)); err != nil {
+		return fmt.Errorf("btrfs remove: shrink parent size: %w", err)
+	}
 	// Parent contents shrank — bump its mtime/ctime.
 	if err := touchDir(rwaAt, rws, partOff, sb, sm, fsTreeRoot, parentIno); err != nil {
 		return fmt.Errorf("btrfs remove: touch parent: %w", err)

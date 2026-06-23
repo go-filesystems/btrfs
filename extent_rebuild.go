@@ -45,9 +45,11 @@ type metaBlock struct {
 
 // dataExtent is one live regular (non-inline) file data extent.
 type dataExtent struct {
-	logAddr uint64
-	length  uint64
-	owner   uint64 // owning FS-tree-family objectid (the EXTENT_DATA_REF root)
+	logAddr    uint64
+	length     uint64
+	owner      uint64 // owning FS-tree-family objectid (the EXTENT_DATA_REF root)
+	objectid   uint64 // owning inode number (EXTENT_DATA_REF.objectid)
+	fileOffset uint64 // EXTENT_DATA_REF.offset = key_offset - extent_data.offset
 }
 
 // rebuildExtentTree recomputes the EXTENT_TREE leaf so it exactly describes the
@@ -143,7 +145,7 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 		recs = append(recs, itemRec{key{b.logAddr, typeMetadataItem, 0}, buildMetadataItemBytes(le, b.owner)})
 	}
 	for _, de := range dataExtents {
-		recs = append(recs, itemRec{key{de.logAddr, typeExtentItem, de.length}, buildDataExtentItemBytes(le, de.owner)})
+		recs = append(recs, itemRec{key{de.logAddr, typeExtentItem, de.length}, buildDataExtentItemBytes(le, de.owner, de.objectid, de.fileOffset)})
 	}
 	var bgStarts []uint64
 	for cs := range bgLenFlags {
@@ -287,7 +289,20 @@ func collectDataExtents(rwaAt readerWriterAt, partOff int64, sb *superblock) []d
 				if disk == 0 || num == 0 {
 					continue // sparse hole
 				}
-				out = append(out, dataExtent{logAddr: disk, length: num, owner: owner})
+				// EXTENT_DATA_REF.objectid is the owning inode (the EXTENT_DATA
+				// key's objectid); .offset is the file logical offset that maps
+				// to the start of this extent, i.e. key_offset - extent.offset.
+				extOff := uint64(0)
+				if len(ed) >= extDataOffOffset+8 {
+					extOff = le.Uint64(ed[extDataOffOffset:])
+				}
+				out = append(out, dataExtent{
+					logAddr:    disk,
+					length:     num,
+					owner:      owner,
+					objectid:   it.k.objID,
+					fileOffset: it.k.offset - extOff,
+				})
 			}
 			return nil
 		})
@@ -300,7 +315,7 @@ func collectDataExtents(rwaAt readerWriterAt, partOff int64, sb *superblock) []d
 // an inline EXTENT_DATA_REF (type 0xB2) of 5 bytes... we instead emit the
 // simplest accepted form: extent_item + inline DATA ref. For our single-owner
 // extents the kernel/check accept refs=1 with a shared-data backref.
-func buildDataExtentItemBytes(le binary.ByteOrder, owner uint64) []byte {
+func buildDataExtentItemBytes(le binary.ByteOrder, owner, objectid, fileOffset uint64) []byte {
 	const extentFlagData = 1 << 0 // BTRFS_EXTENT_FLAG_DATA
 	// extent_item(24) + inline ref: type(1) EXTENT_DATA_REF(0xB2) + ref(28)
 	// = btrfs_extent_data_ref{root,objectid,offset,count}. count=1.
@@ -310,8 +325,8 @@ func buildDataExtentItemBytes(le binary.ByteOrder, owner uint64) []byte {
 	le.PutUint64(d[16:], extentFlagData) // flags
 	d[24] = 0xB2                         // BTRFS_EXTENT_DATA_REF_KEY inline type
 	le.PutUint64(d[25:], owner)          // root
-	le.PutUint64(d[33:], rootDirObjID)   // objectid (owning inode; best-effort)
-	le.PutUint64(d[41:], 0)              // offset
+	le.PutUint64(d[33:], objectid)       // objectid (owning inode)
+	le.PutUint64(d[41:], fileOffset)     // offset (file logical offset of extent)
 	le.PutUint32(d[49:], 1)              // count
 	return d
 }

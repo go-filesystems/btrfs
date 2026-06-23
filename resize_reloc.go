@@ -16,17 +16,22 @@ package filesystem_btrfs
 //     super.bytes_used are then recomputed by rebuildExtentTree (invoked from
 //     updateFsTreeRoot), exactly as on the write path.
 //
-//   - METADATA tree blocks (B-tree nodes) sitting in the tail are relocated
-//     implicitly: every COW mutation we issue allocates its replacement node
-//     from the lowest free block, and we evict the tail from the free list
-//     first so nothing new lands there. Any pre-existing live metadata node
-//     still inside the tail after relocation is detected and the shrink is
-//     refused with a clear error rather than truncating live metadata away.
+//   - METADATA tree blocks (B-tree nodes) sitting in the tail are relocated two
+//     ways. FS_TREE nodes are reseated implicitly: every COW mutation allocates
+//     its replacement node from the lowest free block, with the tail evicted
+//     first so nothing new lands there. The single-leaf roots of the OTHER trees
+//     (EXTENT / DEV / CSUM / UUID / ROOT / DATA_RELOC), which data relocation
+//     does not touch, are COW-relocated explicitly by relocateTailMetadata:
+//     allocate a low block, copy the node, rewrite its header bytenr, repoint the
+//     ROOT_ITEM (or the superblock for the root tree), and let rebuildExtentTree
+//     re-account. Both are validated against the real kernel (TestRelocMeta_*).
 //
-// The boundary (what we refuse): a tail that still holds live metadata blocks
-// not reachable from the COW we performed, or a tail covering an entire chunk
-// (chunk/dev-tree relocation is a separate, larger piece of work). Those cases
-// return a descriptive error and leave the image untouched and valid.
+// The boundary (what we still refuse, with a descriptive error and the image
+// left untouched and valid): a tail block this writer cannot relocate — a
+// multi-level interior tree node, or the chunk tree itself (which lives in the
+// SYSTEM chunk and is never in the DATA tail). Whole-chunk removal lives in
+// resize_chunk.go; relocating a non-empty chunk's contents into a lower chunk
+// (cross-chunk content relocation) remains out of scope.
 
 import (
 	"encoding/binary"
@@ -202,16 +207,193 @@ func (fs *btrfsFS) relocateTailExtents(dropStart, dropEnd uint64) error {
 		}
 	}
 
-	// Verify the tail is now free of live metadata. The data COW above reseated
-	// FS_TREE nodes below the new size; but pre-existing metadata blocks of
-	// OTHER trees (extent/dev/csum/uuid/root) that already sat in the tail are
-	// not moved by data relocation. If any remain we refuse — truncating them
-	// would destroy live metadata. We have not finalized the transaction (the
-	// on-disk superblock still points at the pre-relocation roots), so the
-	// image is left valid and untouched.
+	// The data COW above reseated FS_TREE nodes below the new size; but
+	// pre-existing metadata blocks of OTHER trees (extent/dev/csum/uuid/root/
+	// data-reloc) that already sat in the tail are not moved by data relocation.
+	// COW-relocate those tree blocks too (allocate a low block, copy + rewrite
+	// the node header, repoint the ROOT_ITEM / superblock, bump generation), so
+	// nothing live remains in the tail.
+	if err := fs.relocateTailMetadata(dropStart, dropEnd); err != nil {
+		return err
+	}
+
+	// Post-condition: the tail must now be free of every live metadata block.
+	// Anything left is a block this writer cannot relocate (a multi-level
+	// interior node, or the chunk tree itself); refuse rather than truncate it.
 	if hit, found := fs.liveMetaInRange(dropStart, dropEnd); found {
-		return fmt.Errorf("live metadata block at logical 0x%X remains in [%d, %d) after relocation (metadata-block relocation not supported)",
+		return fmt.Errorf("live metadata block at logical 0x%X remains in [%d, %d) after relocation (metadata-block relocation not supported for this block)",
 			hit, dropStart, dropEnd)
+	}
+	return nil
+}
+
+// relocateTailMetadata COW-relocates every live single-leaf tree-root block that
+// overlaps [dropStart, dropEnd) — the EXTENT / DEV / CSUM / UUID / ROOT /
+// DATA_RELOC tree roots — to a freshly allocated block below dropStart. The
+// FS_TREE is handled by data relocation's COW path and the CHUNK_TREE lives in
+// the SYSTEM chunk (never in the DATA tail), so neither is touched here.
+//
+// Each relocated block is copied verbatim, its node-header bytenr (0x30) is
+// rewritten to the new logical address and its generation (0x50) bumped to the
+// committing transaction's generation; the referencing pointer is then fixed:
+//
+//   - ROOT_TREE root: fs.sb.rootLogAddr is updated (the superblock's
+//     sbfRootLogAddr is persisted later by the finalize) and every subsequent
+//     in-place ROOT_ITEM edit targets the new root-tree leaf.
+//   - any other tree: its ROOT_ITEM.bytenr (+ .generation/.generation_v2) in the
+//     ROOT_TREE leaf is rewritten in place.
+//
+// The EXTENT_TREE accounting (METADATA_ITEM addresses, block-group `used`) is
+// recomputed afterwards by rebuildExtentTree (run from updateFsTreeRoot in the
+// Shrink finalize), so only the live (relocated) blocks are recorded.
+//
+// Multi-level trees (an interior root node, or a tail block that is not a tree
+// root) are out of scope: they are left in place and the caller's post-condition
+// check turns them into a precise refusal. Caller holds fs.mu.
+func (fs *btrfsFS) relocateTailMetadata(dropStart, dropEnd uint64) error {
+	overlaps := func(logAddr uint64) bool {
+		phys := physFromLog(fs.sb, logAddr)
+		return phys < dropEnd && phys+uint64(fs.sb.nodeSize) > dropStart
+	}
+
+	// Relocate the ROOT_TREE leaf first so later ROOT_ITEM edits land in the
+	// moved leaf. The root tree is single-leaf for images this writer produces.
+	if overlaps(fs.sb.rootLogAddr) {
+		rootBuf, err := readNode(fs.rwa, fs.partOffset, fs.sb, fs.sb.rootLogAddr)
+		if err != nil {
+			return fmt.Errorf("relocate root tree: read: %w", err)
+		}
+		if parseNodeHeader(rootBuf).level != 0 {
+			return fmt.Errorf("relocate root tree: multi-level root tree not supported (block 0x%X in tail)", fs.sb.rootLogAddr)
+		}
+		newLog, err := fs.relocateLeafBlock(fs.sb.rootLogAddr, dropStart)
+		if err != nil {
+			return fmt.Errorf("relocate root tree: %w", err)
+		}
+		fs.sb.rootLogAddr = newLog
+	}
+
+	// Relocate every other tree referenced by a ROOT_ITEM whose root node sits in
+	// the tail. We snapshot the (objID -> bytenr) set from the (possibly moved)
+	// root-tree leaf, then relocate and repoint each in turn.
+	type rootRef struct {
+		objID  uint64
+		bytenr uint64
+	}
+	var refs []rootRef
+	if err := walkLeaves(fs.rwa, fs.partOffset, fs.sb, fs.sb.rootLogAddr, func(buf []byte, items []leafItem) error {
+		for _, it := range items {
+			if it.k.typ != typeRootItem {
+				continue
+			}
+			// FS_TREE is reseated by the data-COW path; its ROOT_ITEM bytenr is
+			// fixed by updateFsTreeRoot in the finalize. Skip it here.
+			if it.k.objID == fsTreeObjID {
+				continue
+			}
+			d := it.data(buf)
+			if len(d) < rootItemOffBytenr+8 {
+				continue
+			}
+			br := binary.LittleEndian.Uint64(d[rootItemOffBytenr:])
+			if br != 0 && overlaps(br) {
+				refs = append(refs, rootRef{it.k.objID, br})
+			}
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("scan root items: %w", err)
+	}
+
+	for _, r := range refs {
+		buf, err := readNode(fs.rwa, fs.partOffset, fs.sb, r.bytenr)
+		if err != nil {
+			return fmt.Errorf("relocate tree %d: read root 0x%X: %w", r.objID, r.bytenr, err)
+		}
+		if parseNodeHeader(buf).level != 0 {
+			return fmt.Errorf("relocate tree %d: multi-level root not supported (block 0x%X in tail)", r.objID, r.bytenr)
+		}
+		newLog, err := fs.relocateLeafBlock(r.bytenr, dropStart)
+		if err != nil {
+			return fmt.Errorf("relocate tree %d: %w", r.objID, err)
+		}
+		if err := fs.repointRootItemLocked(r.objID, newLog); err != nil {
+			return fmt.Errorf("relocate tree %d: repoint ROOT_ITEM: %w", r.objID, err)
+		}
+	}
+	return nil
+}
+
+// relocateLeafBlock copies the single tree-block at oldLog to a freshly
+// allocated node block strictly below limit, rewrites the copy's node-header
+// bytenr and generation, writes it, and returns the new logical address. The old
+// physical block is inside the tail being removed (already evicted from the free
+// list), so it is not returned to the allocator. Caller holds fs.mu.
+func (fs *btrfsFS) relocateLeafBlock(oldLog, limit uint64) (uint64, error) {
+	oldPhys, err := fs.sb.physAddr(fs.partOffset, oldLog)
+	if err != nil {
+		return 0, fmt.Errorf("locate block 0x%X: %w", oldLog, err)
+	}
+	buf := make([]byte, fs.sb.nodeSize)
+	if _, err := fs.rwa.ReadAt(buf, oldPhys); err != nil {
+		return 0, fmt.Errorf("read block 0x%X: %w", oldLog, err)
+	}
+	newPhys, err := fs.sm.allocNodeBlock()
+	if err != nil {
+		return 0, fmt.Errorf("alloc replacement block: %w", err)
+	}
+	if newPhys+uint64(fs.sb.nodeSize) > limit {
+		fs.sm.freeRange(newPhys, uint64(fs.sb.nodeSize))
+		return 0, fmt.Errorf("no free metadata block below new size %d", limit)
+	}
+	newLog := physToLog(fs.sb, newPhys)
+	le := binary.LittleEndian
+	le.PutUint64(buf[0x30:], newLog)             // header.bytenr
+	le.PutUint64(buf[0x50:], fs.sb.generation+1) // header.generation (committing txn)
+	updateNodeCRC(buf)
+	if _, err := fs.rwa.WriteAt(buf, fs.partOffset+int64(newPhys)); err != nil {
+		fs.sm.freeRange(newPhys, uint64(fs.sb.nodeSize))
+		return 0, fmt.Errorf("write relocated block at 0x%X: %w", newPhys, err)
+	}
+	return newLog, nil
+}
+
+// repointRootItemLocked rewrites the ROOT_ITEM (objID, ROOT_ITEM, 0) in the
+// ROOT_TREE leaf so its bytenr points at newBytenr and its generation /
+// generation_v2 match the committing transaction. Edited in place in the
+// (possibly relocated) root-tree leaf at fs.sb.rootLogAddr — its header
+// generation was already bumped when it was relocated, or will be bumped by the
+// finalize when it was not moved. Caller holds fs.mu.
+func (fs *btrfsFS) repointRootItemLocked(objID, newBytenr uint64) error {
+	phys, err := fs.sb.physAddr(fs.partOffset, fs.sb.rootLogAddr)
+	if err != nil {
+		return fmt.Errorf("locate root tree leaf: %w", err)
+	}
+	leaf := make([]byte, fs.sb.nodeSize)
+	if _, err := fs.rwa.ReadAt(leaf, phys); err != nil {
+		return fmt.Errorf("read root tree leaf: %w", err)
+	}
+	if parseNodeHeader(leaf).level != 0 {
+		return fmt.Errorf("multi-level root tree")
+	}
+	idx := findItemIdx(leaf, objID, typeRootItem, 0)
+	if idx < 0 {
+		return fmt.Errorf("ROOT_ITEM %d not found", objID)
+	}
+	items := parseLeafItems(leaf, parseNodeHeader(leaf).nItems)
+	d := items[idx].data(leaf)
+	if len(d) < rootItemOffBytenr+8 {
+		return fmt.Errorf("ROOT_ITEM %d too short", objID)
+	}
+	le := binary.LittleEndian
+	le.PutUint64(d[rootItemOffBytenr:], newBytenr)
+	le.PutUint64(d[rootItemOffGeneration:], fs.sb.generation+1)
+	if len(d) > rootItemOffGenerationV2+8 {
+		le.PutUint64(d[rootItemOffGenerationV2:], fs.sb.generation+1)
+	}
+	updateNodeCRC(leaf)
+	if _, err := fs.rwa.WriteAt(leaf, phys); err != nil {
+		return fmt.Errorf("write root tree leaf: %w", err)
 	}
 	return nil
 }

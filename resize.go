@@ -13,11 +13,13 @@ package filesystem_btrfs
 //     shrink the trailing chunk's `size` and its DEV_EXTENT length, refresh
 //     the SB / dev_item / sys_chunk_array, fix the BLOCK_GROUP_ITEM length,
 //     and truncate the device. When the tail is inhabited, COW-relocate the
-//     live DATA extents out of it into free space below the new size (see
-//     resize_reloc.go), then proceed. Tails holding live metadata blocks that
-//     data relocation cannot evacuate, and tails covering an entire chunk, are
-//     refused with a descriptive error (metadata-block and chunk relocation
-//     are out of scope for this writer).
+//     live DATA extents AND the non-FS tree-root metadata blocks out of it into
+//     free space below the new size (see resize_reloc.go), then proceed. When
+//     the shrink drops an entire trailing chunk, remove it wholesale if it is
+//     empty and a lower chunk anchors the device tail (see resize_chunk.go).
+//     The residual refusals (image left untouched): a tail block this writer
+//     cannot relocate (a multi-level interior node), and a non-empty whole-chunk
+//     drop that would need cross-chunk content relocation.
 //   - Resize: thin dispatcher that picks Grow vs Shrink (or no-op when
 //     the new size equals the current size).
 //
@@ -186,8 +188,16 @@ func (fs *btrfsFS) Shrink(newSizeBytes int64) error {
 	}
 	tail := fs.sb.sysChunks[tailIdx]
 	if uint64(newSizeBytes) <= tail.physStart {
-		return fmt.Errorf("btrfs shrink: new size %d would remove entire trailing chunk at phys 0x%X (chunk relocation not supported)",
-			newSizeBytes, tail.physStart)
+		// The shrink drops the entire trailing chunk. Remove it wholesale when it
+		// is empty and a lower local chunk anchors the new device tail (mirrors
+		// `btrfs balance -dusage=0` + `btrfs filesystem resize`). Anything else —
+		// a partial drop into the chunk below, the only/bootstrap chunk, or a
+		// non-empty chunk needing cross-chunk content relocation — is refused.
+		if err := fs.removeWholeTrailingChunkLocked(tailIdx, uint64(newSizeBytes)); err != nil {
+			return fmt.Errorf("btrfs shrink: %w", err)
+		}
+		fs.invalidateCache()
+		return nil
 	}
 	dropStart := uint64(newSizeBytes)
 	dropEnd := uint64(cur)
@@ -642,12 +652,21 @@ func (sm *spaceManager) rangeFree(start, size uint64) bool {
 //     loop-mounts it with every file byte-identical (see
 //     TestReloc_KernelOracle).
 //
+// Also implemented:
+//
+//   - METADATA tree blocks of trees other than the FS_TREE sitting in the tail
+//     (EXTENT / DEV / CSUM / UUID / ROOT / DATA_RELOC roots) are COW-relocated
+//     below the new size by relocateTailMetadata (resize_reloc.go); the
+//     EXTENT_TREE is then rebuilt to account them. btrfs-check / kernel-mount
+//     validated (TestRelocMeta_KernelOracle).
+//   - A shrink that removes an entire EMPTY trailing chunk deletes its
+//     CHUNK_ITEM / DEV_EXTENT / BLOCK_GROUP_ITEM / sys_chunk_array entry
+//     (resize_chunk.go), mirroring btrfs_remove_chunk; validated by
+//     TestRemoveChunk_KernelOracle.
+//
 // Out of scope (refused with a clear error, image left untouched):
 //
-//   - METADATA tree blocks of trees other than the FS_TREE sitting in the
-//     tail. The relocation pass COWs the FS_TREE (reseating its nodes below
-//     the new size), but does not relocate extent/dev/csum/uuid/root-tree
-//     blocks; a leftover live metadata block in the tail is detected and the
-//     shrink refused rather than truncated.
-//   - A shrink that would remove an entire chunk (chunk-tree / dev-tree
-//     chunk relocation is a larger, separate piece of work).
+//   - A tail block this writer cannot relocate: a multi-level interior tree
+//     node (only single-leaf tree roots are moved).
+//   - A non-empty whole-chunk drop, which would need the chunk's live contents
+//     relocated into a lower chunk first (cross-chunk content relocation).

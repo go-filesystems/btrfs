@@ -612,10 +612,19 @@ func updateFsTreeRoot(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *s
 		// btrfs_root_item: bytenr at 0xB0, generation at 0xA0. generation_v2
 		// (0xEF) must track generation or the kernel warns "mismatching
 		// generation and generation_v2" and resets the new fields on mount.
+		//
+		// The ROOT_ITEM.generation must equal the FS-root NODE's header
+		// generation (the kernel's parent_transid check compares them). In the
+		// normal write path the FS root is COW-reseated to sb.generation+1, so
+		// that is the value; but a metadata-only shrink (resize_reloc.go) does not
+		// touch the FS tree, leaving its root node at an older generation. Read the
+		// node's actual header generation rather than assuming sb.generation+1, so
+		// the two stay coherent in both cases.
+		fsRootGen := fsRootNodeGeneration(rwaAt, partOff, sb, newFsRoot, sb.generation+1)
 		binary.LittleEndian.PutUint64(d[0xB0:], newFsRoot)
-		binary.LittleEndian.PutUint64(d[rootItemOffGeneration:], sb.generation+1)
+		binary.LittleEndian.PutUint64(d[rootItemOffGeneration:], fsRootGen)
 		if len(d) > rootItemOffGenerationV2+8 {
-			binary.LittleEndian.PutUint64(d[rootItemOffGenerationV2:], sb.generation+1)
+			binary.LittleEndian.PutUint64(d[rootItemOffGenerationV2:], fsRootGen)
 		}
 		newRootRoot, rerr := cowUpdate(nil, rwaAt, partOff, sb, sm, sb.rootLogAddr, key{fsTreeObjID, typeRootItem, 0}, d)
 		if rerr == nil {
@@ -631,6 +640,17 @@ func updateFsTreeRoot(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *s
 		return fmt.Errorf("btrfs: rebuild extent tree: %w", rebErr)
 	}
 	return writeSuperblock(rwaAt, partOff, sb, newFsRoot)
+}
+
+// fsRootNodeGeneration returns the header generation (0x50) of the FS-tree root
+// node at logAddr, or fallback when the node cannot be read. The FS ROOT_ITEM
+// generation must match this value for the kernel's parent_transid check.
+func fsRootNodeGeneration(rwaAt readerWriterAt, partOff int64, sb *superblock, logAddr, fallback uint64) uint64 {
+	buf, err := readNode(rwaAt, partOff, sb, logAddr)
+	if err != nil {
+		return fallback
+	}
+	return binary.LittleEndian.Uint64(buf[0x50:])
 }
 
 func writeSuperblock(rwaAt readerWriterAt, partOff int64, sb *superblock, newFsRoot uint64) error {

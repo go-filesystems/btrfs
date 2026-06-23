@@ -112,60 +112,88 @@ func TestRemoveChunk_NonEmptyUsedFlagCorrected(t *testing.T) {
 // TestRelocMeta_RefusesMultiLevelRoot fakes a multi-level root tree in the tail
 // and asserts relocateTailMetadata refuses it with a clear error rather than
 // mishandling an interior node.
-func TestRelocMeta_RefusesMultiLevelRoot(t *testing.T) {
-	fs, _ := resizeTempImage(t, 24*1024*1024)
-	if err := fs.WriteFile("/x", []byte("x"), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	// Mark the in-memory root-tree node "multi-level" by flipping its on-disk
-	// header level to 1 at its current block, then point a relocation window at
-	// it. relocateTailMetadata must refuse the multi-level root tree.
-	phys, err := fs.sb.physAddr(fs.partOffset, fs.sb.rootLogAddr)
+// TestRelocMeta_MultiLevelRootTreeLeafInTail builds a genuine multi-level
+// ROOT_TREE whose ROOT_ITEM leaf sits in the removed tail, then shrinks. The
+// relocation must COW the leaf (and its interior parent) below the new size,
+// re-seat the superblock `root` pointer, and leave every file byte-identical.
+// Runs on every CI arch (no kernel).
+func TestRelocMeta_MultiLevelRootTreeLeafInTail(t *testing.T) {
+	path := t.TempDir() + "/mlroot.img"
+	fs, err := Format(path, 24*1024*1024, FormatConfig{Label: "mlroot"})
 	if err != nil {
-		t.Fatalf("physAddr: %v", err)
+		t.Fatalf("Format: %v", err)
 	}
-	buf := make([]byte, fs.sb.nodeSize)
-	if _, err := fs.rwa.ReadAt(buf, phys); err != nil {
-		t.Fatalf("read: %v", err)
+	bfs := fs.(*btrfsFS)
+	files := map[string][]byte{
+		"/a.txt": bytes.Repeat([]byte("ROOTLEAF"), 600),
+		"/b.txt": []byte("multi-level root tree\n"),
 	}
-	buf[0x64] = 1 // level = 1 (pretend interior)
-	updateNodeCRC(buf)
-	if _, err := fs.rwa.WriteAt(buf, phys); err != nil {
-		t.Fatalf("write: %v", err)
+	for name, data := range files {
+		if err := fs.WriteFile(name, data, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
 	}
-	fs.invalidateCache()
-	// Window covering the root-tree block's physical address.
-	rootPhys := physFromLog(fs.sb, fs.sb.rootLogAddr)
-	err = fs.relocateTailMetadata(rootPhys, rootPhys+uint64(fs.sb.nodeSize))
-	if err == nil || !strings.Contains(err.Error(), "multi-level root tree") {
-		t.Errorf("expected multi-level root-tree refusal, got: %v", err)
+	// Split the ROOT_TREE into a real two-level tree: interior node at 21 MiB,
+	// right child leaf (carrying the upper ROOT_ITEMs) at 20 MiB — both inside
+	// [18,24) MiB.
+	placeRootTreeMultiLevelHigh(t, bfs, 21*1024*1024, 20*1024*1024)
+
+	if err := bfs.Shrink(18 * 1024 * 1024); err != nil {
+		t.Fatalf("Shrink with multi-level root-tree leaf in tail: %v", err)
+	}
+	if got := readSBTotalBytes(t, bfs); got != 18*1024*1024 {
+		t.Errorf("post-shrink total_bytes = %d, want %d", got, 18*1024*1024)
+	}
+	assertNoMetaAboveLocked(t, bfs, 18*1024*1024)
+
+	r2 := reopenBtrfs(t, bfs, path)
+	defer r2.Close()
+	for name, data := range files {
+		if got, err := r2.ReadFile(name); err != nil || !bytes.Equal(got, data) {
+			t.Errorf("after shrink %s mismatch: err=%v len=%d want %d", name, err, len(got), len(data))
+		}
 	}
 }
 
-// TestRelocMeta_RefusesMultiLevelExtentTree builds a genuine two-level EXTENT
-// tree with a node in the tail and asserts relocateTailMetadata refuses it: the
-// extent tree's own nodes cannot be relocated while rebuildExtentTree rewrites
-// its leaf in place under a single-leaf assumption. The image is left consistent.
-func TestRelocMeta_RefusesMultiLevelExtentTree(t *testing.T) {
+// TestRelocMeta_MultiLevelExtentTreeShrinks builds a genuine two-level EXTENT
+// tree with a node in the tail and asserts the shrink now SUCCEEDS: the extent
+// tree is not relocated block-by-block but rebuilt low and multi-level by the
+// finalize, evacuating its tail nodes. The files survive byte-identical and no
+// live metadata remains above the new size. Runs on every arch (no kernel).
+func TestRelocMeta_MultiLevelExtentTreeShrinks(t *testing.T) {
 	path := t.TempDir() + "/mlext.img"
 	fs, err := Format(path, 24*1024*1024, FormatConfig{Label: "mlext"})
 	if err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	bfs := fs.(*btrfsFS)
-	if err := fs.WriteFile("/x", bytes.Repeat([]byte("x"), 4096), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
+	files := map[string][]byte{
+		"/x": bytes.Repeat([]byte("x"), 4096),
+		"/y": []byte("extent tree multi-level\n"),
+	}
+	for name, data := range files {
+		if err := fs.WriteFile(name, data, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
 	}
 	// Make the EXTENT tree genuinely two-level with its interior node high in the
 	// [18,24) MiB tail.
 	placeTreeMultiLevelHigh(t, bfs, extentTreeObjID, 21*1024*1024, 20*1024*1024)
-	bfs.mu.Lock()
-	defer bfs.mu.Unlock()
-	err = bfs.relocateTailMetadata(18*1024*1024, 24*1024*1024)
-	if err == nil || !strings.Contains(err.Error(), "multi-level extent tree") {
-		t.Errorf("expected multi-level extent-tree refusal, got: %v", err)
+
+	if err := bfs.Shrink(18 * 1024 * 1024); err != nil {
+		t.Fatalf("Shrink with multi-level extent tree in tail: %v", err)
+	}
+	if got := readSBTotalBytes(t, bfs); got != 18*1024*1024 {
+		t.Errorf("post-shrink total_bytes = %d, want %d", got, 18*1024*1024)
+	}
+	assertNoMetaAboveLocked(t, bfs, 18*1024*1024)
+
+	r2 := reopenBtrfs(t, bfs, path)
+	defer r2.Close()
+	for name, data := range files {
+		if got, err := r2.ReadFile(name); err != nil || !bytes.Equal(got, data) {
+			t.Errorf("after shrink %s mismatch: err=%v len=%d", name, err, len(got))
+		}
 	}
 }
 
@@ -196,12 +224,11 @@ func TestRepointRootItem_WriteFault(t *testing.T) {
 	}
 }
 
-// TestShrink_RefusesUnrelocatableMetadata drives a full Shrink whose tail holds
-// a metadata block that relocation cannot move (a genuine two-level EXTENT tree,
-// whose own nodes the in-place rebuild cannot relocate), exercising
-// relocateTailExtents' metadata-error propagation and leaving the image readable
-// at its original size.
-func TestShrink_RefusesUnrelocatableMetadata(t *testing.T) {
+// TestShrink_MultiLevelExtentTreeInTail drives a full Shrink whose tail holds a
+// genuine two-level EXTENT tree. This used to be a refusal; the extent tree is
+// now rebuilt low and multi-level by the finalize, so the shrink succeeds and the
+// data survives byte-identical at the smaller size.
+func TestShrink_MultiLevelExtentTreeInTail(t *testing.T) {
 	path := t.TempDir() + "/unreloc.img"
 	fs, err := Format(path, 24*1024*1024, FormatConfig{Label: "unreloc"})
 	if err != nil {
@@ -212,16 +239,15 @@ func TestShrink_RefusesUnrelocatableMetadata(t *testing.T) {
 	if err := fs.WriteFile("/d.bin", payload, 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	// A real two-level EXTENT tree with its interior node in the tail is the
-	// documented refusal boundary.
 	placeTreeMultiLevelHigh(t, bfs, extentTreeObjID, 21*1024*1024, 20*1024*1024)
-	if err := bfs.Shrink(18 * 1024 * 1024); err == nil ||
-		!strings.Contains(err.Error(), "multi-level") {
-		t.Errorf("expected unrelocatable-metadata refusal, got: %v", err)
+	if err := bfs.Shrink(18 * 1024 * 1024); err != nil {
+		t.Fatalf("Shrink with multi-level extent tree in tail: %v", err)
 	}
-	// Image must remain readable at its original size.
-	if got, rerr := fs.ReadFile("/d.bin"); rerr != nil || !bytes.Equal(got, payload) {
-		t.Errorf("image corrupted after refused shrink: err=%v len=%d", rerr, len(got))
+	assertNoMetaAboveLocked(t, bfs, 18*1024*1024)
+	r2 := reopenBtrfs(t, bfs, path)
+	defer r2.Close()
+	if got, rerr := r2.ReadFile("/d.bin"); rerr != nil || !bytes.Equal(got, payload) {
+		t.Errorf("data corrupted after shrink: err=%v len=%d", rerr, len(got))
 	}
 }
 

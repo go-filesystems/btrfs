@@ -156,11 +156,11 @@ func TestReloc_RefusesEntireChunkRemoval(t *testing.T) {
 	}
 }
 
-// TestRemoveChunk_NonEmptyRollback drops a non-empty trailing chunk that also
-// carries an unrelocatable metadata block (a genuine two-level EXTENT tree node)
-// inside it, so relocateNonEmptyChunkLocked refuses mid-way and rolls the evicted
-// chunk range back — leaving the image readable at its original size. Exercises
-// the freeRange rollback path of the whole-chunk relocation.
+// TestRemoveChunk_NonEmptyRollback drops a non-empty trailing chunk whose live
+// contents cannot fit in the lower (anchoring) chunk's free space, so
+// relocateNonEmptyChunkLocked fails on the replacement allocation and rolls the
+// evicted chunk range back — leaving the image readable at its original size.
+// Exercises the freeRange rollback path of the whole-chunk relocation.
 func TestRemoveChunk_NonEmptyRollback(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nerollback.img")
 	fs, err := Format(path, 16*1024*1024, FormatConfig{Label: "neroll"})
@@ -168,21 +168,31 @@ func TestRemoveChunk_NonEmptyRollback(t *testing.T) {
 		t.Fatalf("Format: %v", err)
 	}
 	bfs := fs.(*btrfsFS)
+	// Nearly fill the lower chunk so there is no room to receive the trailing
+	// chunk's contents during relocation.
 	payload := bytes.Repeat([]byte("KEEP-ALIGNED-"), 256*8)
 	if err := fs.WriteFile("/keep.bin", payload, 0o644); err != nil {
 		t.Fatalf("keep: %v", err)
 	}
-	// Append a non-empty trailing DATA chunk holding a live file.
-	tail := bytes.Repeat([]byte("TAIL-ALIGNED-"), 256*8)
+	// Append a non-empty trailing DATA chunk holding a large live file that cannot
+	// be re-homed below the chunk boundary.
+	tail := bytes.Repeat([]byte("TAIL-ALIGNED-"), 256*256)
 	newChunkLog := appendDataChunkWithLiveExtent(t, bfs, 8*1024*1024, "/tail.bin", tail)
-	// Make the EXTENT tree two-level with a node placed inside the trailing chunk
-	// (>= newChunkLog), so the whole-chunk relocation hits the unrelocatable
-	// extent node and must roll back.
-	placeTreeMultiLevelHigh(t, bfs, extentTreeObjID, newChunkLog+2*1024*1024, newChunkLog+1*1024*1024)
+	// Drain the lower chunk's free list so the relocation's replacement allocation
+	// has nowhere below newChunkLog to land, forcing the rollback path.
+	bfs.mu.Lock()
+	var keep []freeExtent
+	for _, fe := range bfs.sm.freeExts {
+		if fe.physStart >= newChunkLog {
+			keep = append(keep, fe)
+		}
+	}
+	bfs.sm.freeExts = keep
+	bfs.mu.Unlock()
 
 	if err := bfs.Shrink(int64(newChunkLog)); err == nil ||
-		!strings.Contains(err.Error(), "multi-level") {
-		t.Errorf("expected unrelocatable-metadata refusal on whole-chunk drop, got: %v", err)
+		!strings.Contains(err.Error(), "no free") {
+		t.Errorf("expected no-free-space rollback on whole-chunk drop, got: %v", err)
 	}
 	// Image must remain readable at its original size.
 	if got, rerr := fs.ReadFile("/keep.bin"); rerr != nil || !bytes.Equal(got, payload) {

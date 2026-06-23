@@ -29,14 +29,18 @@ package filesystem_btrfs
 //     tree) and lets rebuildExtentTree re-account. Validated against the real
 //     kernel (TestRelocMeta_*).
 //
-// The boundary (what we still refuse, with a descriptive error and the image
-// left consistent): a MULTI-LEVEL ROOT_TREE whose ROOT_ITEM leaf would move (the
-// in-place ROOT_ITEM edit cannot descend a multi-level root tree); the
-// EXTENT_TREE's own nodes when the extent tree is multi-level (its leaf is
-// rebuilt in place under a single-leaf assumption); and the chunk tree itself
-// (SYSTEM chunk, never in the DATA tail). Whole-chunk removal — including
-// relocating a NON-empty chunk's contents into a lower chunk (cross-chunk
-// content relocation) — lives in resize_chunk.go.
+// A MULTI-LEVEL ROOT_TREE whose ROOT_ITEM leaf sits in the tail is now handled:
+// relocateSubtreePath COW-moves that leaf (and its interior parents) low and the
+// in-place ROOT_ITEM editors descend the moved tree via tracePath. A MULTI-LEVEL
+// EXTENT_TREE is also handled: it is not relocated block-by-block but rebuilt low
+// and multi-level by buildMultiLevelExtentTree in the finalize (a fixpoint over
+// the extent tree's own self-referential block records), so any extent-tree node
+// in the tail is evacuated automatically.
+//
+// The boundary (what we still refuse, with a descriptive error and the image left
+// consistent): the chunk tree itself (SYSTEM chunk, never in the DATA tail).
+// Whole-chunk removal — including relocating a NON-empty chunk's contents into a
+// lower chunk (cross-chunk content relocation) — lives in resize_chunk.go.
 
 import (
 	"encoding/binary"
@@ -60,6 +64,15 @@ type relocTarget struct {
 // physical block overlaps [dropStart, dropEnd), or returns ok=false when the
 // tail is free of live metadata. Caller must hold fs.mu.
 func (fs *btrfsFS) liveMetaInRange(dropStart, dropEnd uint64) (uint64, bool) {
+	return fs.liveMetaInRangeOpt(dropStart, dropEnd, false)
+}
+
+// liveMetaInRangeOpt is liveMetaInRange with an option to skip the EXTENT_TREE's
+// own blocks. The shrink-relocation post-condition skips them because the extent
+// tree is always rebuilt low by the finalize (rebuildExtentTree), which evacuates
+// any extent-tree node that still sits in the tail at relocation time; the final
+// (post-finalize) assertions check WITHOUT the skip. Caller holds fs.mu.
+func (fs *btrfsFS) liveMetaInRangeOpt(dropStart, dropEnd uint64, skipExtentTree bool) (uint64, bool) {
 	var hit uint64
 	found := false
 	check := func(logAddr uint64) error {
@@ -88,6 +101,9 @@ func (fs *btrfsFS) liveMetaInRange(dropStart, dropEnd uint64) (uint64, bool) {
 			}
 			if it.k.objID == fsTreeObjID {
 				continue // walked via fs.fsTreeRoot above
+			}
+			if skipExtentTree && it.k.objID == extentTreeObjID {
+				continue // evacuated by the finalize rebuild
 			}
 			d := it.data(buf)
 			if len(d) < rootItemOffBytenr+8 {
@@ -222,10 +238,13 @@ func (fs *btrfsFS) relocateTailExtents(dropStart, dropEnd uint64) error {
 		return err
 	}
 
-	// Post-condition: the tail must now be free of every live metadata block.
-	// Anything left is a block this writer cannot relocate (a multi-level
-	// interior node, or the chunk tree itself); refuse rather than truncate it.
-	if hit, found := fs.liveMetaInRange(dropStart, dropEnd); found {
+	// Post-condition: the tail must now be free of every live metadata block,
+	// EXCEPT the EXTENT_TREE's own nodes — those are evacuated low by the finalize
+	// rebuild (updateFsTreeRoot → rebuildExtentTree → buildMultiLevelExtentTree),
+	// which always reconstructs the extent tree from the lowest free blocks.
+	// Anything else left is a block this writer cannot relocate (the chunk tree
+	// itself); refuse rather than truncate it.
+	if hit, found := fs.liveMetaInRangeOpt(dropStart, dropEnd, true); found {
 		return fmt.Errorf("live metadata block at logical 0x%X remains in [%d, %d) after relocation (metadata-block relocation not supported for this block)",
 			hit, dropStart, dropEnd)
 	}
@@ -256,15 +275,13 @@ func (fs *btrfsFS) relocateTailExtents(dropStart, dropEnd uint64) error {
 //
 // The EXTENT_TREE accounting (METADATA_ITEM addresses, block-group `used`) is
 // recomputed afterwards by rebuildExtentTree (run from updateFsTreeRoot in the
-// Shrink finalize) — it walks interior nodes too, so a relocated multi-level
-// tree is accounted automatically.
-//
-// Still out of scope (a precise refusal, image left consistent): a MULTI-LEVEL
-// ROOT_TREE whose ROOT_ITEM leaf would move (repointRootItemLocked edits the
-// single root-tree leaf in place and cannot descend), and the EXTENT_TREE's own
-// nodes when the extent tree is multi-level (rebuildExtentTree rewrites the
-// extent leaf in place under a single-leaf assumption). The chunk tree is never
-// relocated. Caller holds fs.mu.
+// Shrink finalize) — it walks interior nodes too and, when the records overflow a
+// single leaf, emits a multi-level extent tree from the lowest free blocks
+// (buildMultiLevelExtentTree). So the EXTENT_TREE is not relocated here at all:
+// its tail nodes are evacuated by being rebuilt low. The ROOT_TREE, including a
+// multi-level root tree whose ROOT_ITEM leaf lands in the tail, IS relocated here.
+// The chunk tree is never relocated (SYSTEM chunk, outside the DATA tail). Caller
+// holds fs.mu.
 func (fs *btrfsFS) relocateTailMetadata(dropStart, dropEnd uint64) error {
 	overlaps := func(logAddr uint64) bool {
 		phys := physFromLog(fs.sb, logAddr)
@@ -284,21 +301,19 @@ func (fs *btrfsFS) relocateTailMetadata(dropStart, dropEnd uint64) error {
 	}
 
 	// Relocate the ROOT_TREE first so later ROOT_ITEM edits land in the moved
-	// tree. The root tree is single-leaf for images this writer produces; a
-	// multi-level root tree whose ROOT_ITEM leaf would move is refused below.
+	// tree. relocateSubtreePath descends a multi-level root tree bottom-up, so a
+	// ROOT_ITEM leaf sitting in the tail is COW-moved out and its interior parent
+	// repointed; the superblock `root` pointer is then re-seated below. The
+	// in-place ROOT_ITEM editors (repointRootItemLocked / updateExtentRootGeneration)
+	// descend the moved tree via tracePath, so a multi-level root tree is handled
+	// end to end.
 	if subtreeTouchesTail(fs.sb.rootLogAddr) {
-		rootBuf, err := readNode(fs.rwa, fs.partOffset, fs.sb, fs.sb.rootLogAddr)
-		if err != nil {
-			return fmt.Errorf("relocate root tree: read: %w", err)
-		}
-		if parseNodeHeader(rootBuf).level != 0 {
-			return fmt.Errorf("relocate root tree: multi-level root tree not supported (root 0x%X, descendant in tail)", fs.sb.rootLogAddr)
-		}
 		newLog, _, err := fs.relocateSubtreePath(fs.sb.rootLogAddr, dropStart, dropEnd, 0)
 		if err != nil {
 			return fmt.Errorf("relocate root tree: %w", err)
 		}
 		fs.sb.rootLogAddr = newLog
+		fs.invalidateCache()
 	}
 
 	// Relocate every other tree referenced by a ROOT_ITEM whose tree has a node
@@ -334,17 +349,15 @@ func (fs *btrfsFS) relocateTailMetadata(dropStart, dropEnd uint64) error {
 	}
 
 	for _, r := range refs {
-		// The EXTENT_TREE is rebuilt in place by rebuildExtentTree under a
-		// single-leaf assumption; relocating its own multi-level nodes mid-rebuild
-		// is circular. A single-leaf extent root in the tail is fine (it relocates
-		// like any other leaf root); a multi-level extent tree with a node in the
-		// tail is refused.
-		buf, err := readNode(fs.rwa, fs.partOffset, fs.sb, r.bytenr)
-		if err != nil {
-			return fmt.Errorf("relocate tree %d: read root 0x%X: %w", r.objID, r.bytenr, err)
-		}
-		if r.objID == extentTreeObjID && parseNodeHeader(buf).level != 0 {
-			return fmt.Errorf("relocate tree %d: multi-level extent tree not supported (root 0x%X, node in tail)", r.objID, r.bytenr)
+		// The EXTENT_TREE is NOT relocated here: the finalize's rebuild
+		// (rebuildExtentTree → buildMultiLevelExtentTree) reconstructs it from the
+		// lowest free blocks, which evacuates any extent-tree node — single-leaf or
+		// multi-level — out of the tail. Relocating it here as well would be
+		// redundant and circular (its own node allocations are themselves extent
+		// records). Skip it; the post-condition check ignores extent-tree blocks
+		// for the same reason.
+		if r.objID == extentTreeObjID {
+			continue
 		}
 		newLog, _, err := fs.relocateSubtreePath(r.bytenr, dropStart, dropEnd, 0)
 		if err != nil {
@@ -475,14 +488,29 @@ func (fs *btrfsFS) relocateLeafBlock(oldLog, limit uint64) (uint64, error) {
 	return fs.relocateNodeBuffer(buf, limit)
 }
 
-// repointRootItemLocked rewrites the ROOT_ITEM (objID, ROOT_ITEM, 0) in the
-// ROOT_TREE leaf so its bytenr points at newBytenr and its generation /
-// generation_v2 match the committing transaction. Edited in place in the
-// (possibly relocated) root-tree leaf at fs.sb.rootLogAddr — its header
-// generation was already bumped when it was relocated, or will be bumped by the
-// finalize when it was not moved. Caller holds fs.mu.
+// rootItemLeafLog returns the logical address of the ROOT_TREE leaf that holds
+// the ROOT_ITEM (objID, ROOT_ITEM, 0). For a single-leaf root tree this is just
+// fs.sb.rootLogAddr; for a multi-level root tree it descends via tracePath to the
+// leaf where that key lives. Caller holds fs.mu.
+func (fs *btrfsFS) rootItemLeafLog(objID uint64) (uint64, error) {
+	return rootItemLeafLogAddr(fs.rwa, fs.partOffset, fs.sb, objID)
+}
+
+// repointRootItemLocked rewrites the ROOT_ITEM (objID, ROOT_ITEM, 0) so its
+// bytenr points at newBytenr and its generation / generation_v2 match the
+// committing transaction. Edited in place in the (possibly relocated) ROOT_TREE
+// leaf that carries it — located via rootItemLeafLog so it works for a
+// single-leaf AND a multi-level root tree. An in-place edit leaves the leaf at
+// its current logical address, so every parent key-ptr (blockptr + generation)
+// stays valid: the leaf header generation was already bumped when the subtree was
+// relocated, or will be bumped by the finalize when it was not moved. Caller
+// holds fs.mu.
 func (fs *btrfsFS) repointRootItemLocked(objID, newBytenr uint64) error {
-	phys, err := fs.sb.physAddr(fs.partOffset, fs.sb.rootLogAddr)
+	leafLog, err := fs.rootItemLeafLog(objID)
+	if err != nil {
+		return err
+	}
+	phys, err := fs.sb.physAddr(fs.partOffset, leafLog)
 	if err != nil {
 		return fmt.Errorf("locate root tree leaf: %w", err)
 	}
@@ -491,7 +519,7 @@ func (fs *btrfsFS) repointRootItemLocked(objID, newBytenr uint64) error {
 		return fmt.Errorf("read root tree leaf: %w", err)
 	}
 	if parseNodeHeader(leaf).level != 0 {
-		return fmt.Errorf("multi-level root tree")
+		return fmt.Errorf("ROOT_ITEM %d leaf 0x%X is not a leaf", objID, leafLog)
 	}
 	idx := findItemIdx(leaf, objID, typeRootItem, 0)
 	if idx < 0 {
@@ -512,6 +540,7 @@ func (fs *btrfsFS) repointRootItemLocked(objID, newBytenr uint64) error {
 	if _, err := fs.rwa.WriteAt(leaf, phys); err != nil {
 		return fmt.Errorf("write root tree leaf: %w", err)
 	}
+	fs.invalidateCache()
 	return nil
 }
 

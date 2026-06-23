@@ -626,6 +626,13 @@ func updateFsTreeRoot(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *s
 		if len(d) > rootItemOffGenerationV2+8 {
 			binary.LittleEndian.PutUint64(d[rootItemOffGenerationV2:], fsRootGen)
 		}
+		// ROOT_ITEM.level must equal the FS-root NODE's header level; the kernel
+		// cross-checks them ("root [N 0] level X does not match Y") and rejects the
+		// filesystem otherwise. The FS tree grows to multiple levels once it
+		// outgrows a single leaf, so read the live level rather than assuming 0.
+		if len(d) > rootItemOffLevel {
+			d[rootItemOffLevel] = fsRootNodeLevel(rwaAt, partOff, sb, newFsRoot)
+		}
 		newRootRoot, rerr := cowUpdate(nil, rwaAt, partOff, sb, sm, sb.rootLogAddr, key{fsTreeObjID, typeRootItem, 0}, d)
 		if rerr == nil {
 			sb.rootLogAddr = newRootRoot
@@ -651,6 +658,16 @@ func fsRootNodeGeneration(rwaAt readerWriterAt, partOff int64, sb *superblock, l
 		return fallback
 	}
 	return binary.LittleEndian.Uint64(buf[0x50:])
+}
+
+// fsRootNodeLevel returns the header level (0x64) of the node at logAddr, or 0
+// when it cannot be read. The FS ROOT_ITEM level must match this value.
+func fsRootNodeLevel(rwaAt readerWriterAt, partOff int64, sb *superblock, logAddr uint64) uint8 {
+	buf, err := readNode(rwaAt, partOff, sb, logAddr)
+	if err != nil {
+		return 0
+	}
+	return parseNodeHeader(buf).level
 }
 
 func writeSuperblock(rwaAt readerWriterAt, partOff int64, sb *superblock, newFsRoot uint64) error {

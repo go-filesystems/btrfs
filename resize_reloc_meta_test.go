@@ -530,6 +530,113 @@ func placeTreeMultiLevelHigh(t *testing.T, bfs *btrfsFS, objID, nodeHighPhys, le
 	return nodeLog
 }
 
+// placeRootTreeMultiLevelHigh splits the ROOT_TREE's single leaf into a genuine
+// two-level tree: a low LEFT child leaf, a RIGHT child leaf placed at
+// leafHighPhys (in the tail), and a level-1 interior node placed at nodeHighPhys
+// (also in the tail) that becomes the new root. The superblock `root` pointer is
+// repointed at the interior node. The split is surgical (current generation
+// preserved); the extent tree is then rebuilt so the new blocks are accounted.
+// Returns the interior node's logical address. Caller must NOT hold bfs.mu.
+func placeRootTreeMultiLevelHigh(t *testing.T, bfs *btrfsFS, nodeHighPhys, leafHighPhys uint64) uint64 {
+	t.Helper()
+	bfs.mu.Lock()
+	defer bfs.mu.Unlock()
+	le := binary.LittleEndian
+
+	oldLog := bfs.sb.rootLogAddr
+	oldPhys := physFromLog(bfs.sb, oldLog)
+	leaf := make([]byte, bfs.sb.nodeSize)
+	if _, err := bfs.rwa.ReadAt(leaf, bfs.partOffset+int64(oldPhys)); err != nil {
+		t.Fatalf("placeRootTreeMultiLevelHigh: read leaf: %v", err)
+	}
+	hdr := parseNodeHeader(leaf)
+	if hdr.level != 0 {
+		t.Fatalf("placeRootTreeMultiLevelHigh: root tree not single-leaf (level %d)", hdr.level)
+	}
+	n := int(hdr.nItems)
+	if n < 2 {
+		t.Fatalf("placeRootTreeMultiLevelHigh: root tree has %d items, need >=2", n)
+	}
+	splitAt := n / 2
+
+	left := make([]byte, bfs.sb.nodeSize)
+	copy(left, leaf)
+	for i := n - 1; i >= splitAt; i-- {
+		leafDeleteItem(left, i)
+	}
+	right := make([]byte, bfs.sb.nodeSize)
+	copy(right, leaf)
+	for i := splitAt - 1; i >= 0; i-- {
+		leafDeleteItem(right, i)
+	}
+	leftKey := readKey(left[nodeHdrSize:])
+	rightKey := readKey(right[nodeHdrSize:])
+	gen := le.Uint64(leaf[0x50:])
+
+	leftPhys, err := bfs.sm.allocNodeBlock()
+	if err != nil {
+		t.Fatalf("placeRootTreeMultiLevelHigh: alloc left leaf: %v", err)
+	}
+	leftLog := physToLog(bfs.sb, leftPhys)
+	le.PutUint64(left[0x30:], leftLog)
+	le.PutUint64(left[0x50:], gen)
+	updateNodeCRC(left)
+	if _, err := bfs.rwa.WriteAt(left, bfs.partOffset+int64(leftPhys)); err != nil {
+		t.Fatalf("placeRootTreeMultiLevelHigh: write left leaf: %v", err)
+	}
+
+	rightLog := physToLog(bfs.sb, leafHighPhys)
+	le.PutUint64(right[0x30:], rightLog)
+	le.PutUint64(right[0x50:], gen)
+	updateNodeCRC(right)
+	if _, err := bfs.rwa.WriteAt(right, bfs.partOffset+int64(leafHighPhys)); err != nil {
+		t.Fatalf("placeRootTreeMultiLevelHigh: write right leaf: %v", err)
+	}
+	bfs.sm.remove(leafHighPhys, uint64(bfs.sb.nodeSize))
+
+	node := make([]byte, bfs.sb.nodeSize)
+	copy(node[:nodeHdrSize], leaf[:nodeHdrSize])
+	node[0x64] = 1
+	le.PutUint32(node[0x60:], 2)
+	le.PutUint64(node[0x50:], gen)
+	writeKeyPtr := func(idx int, k key, blk, g uint64) {
+		off := nodeHdrSize + idx*keyPtrSize
+		le.PutUint64(node[off:], k.objID)
+		node[off+8] = k.typ
+		le.PutUint64(node[off+9:], k.offset)
+		le.PutUint64(node[off+17:], blk)
+		le.PutUint64(node[off+25:], g)
+	}
+	writeKeyPtr(0, leftKey, leftLog, gen)
+	writeKeyPtr(1, rightKey, rightLog, gen)
+	nodeLog := physToLog(bfs.sb, nodeHighPhys)
+	le.PutUint64(node[0x30:], nodeLog)
+	updateNodeCRC(node)
+	if _, err := bfs.rwa.WriteAt(node, bfs.partOffset+int64(nodeHighPhys)); err != nil {
+		t.Fatalf("placeRootTreeMultiLevelHigh: write interior node: %v", err)
+	}
+	bfs.sm.remove(nodeHighPhys, uint64(bfs.sb.nodeSize))
+	bfs.sm.freeRange(oldPhys, uint64(bfs.sb.nodeSize))
+
+	// Repoint the superblock root at the interior node.
+	bfs.sb.rootLogAddr = nodeLog
+	sbuf := make([]byte, sbfSize)
+	if _, err := bfs.rwa.ReadAt(sbuf, bfs.partOffset+superblockOffset); err != nil {
+		t.Fatalf("placeRootTreeMultiLevelHigh: read sb: %v", err)
+	}
+	le.PutUint64(sbuf[sbfRootLogAddr:], nodeLog)
+	updateSuperblockCRC(sbuf)
+	if _, err := bfs.rwa.WriteAt(sbuf, bfs.partOffset+superblockOffset); err != nil {
+		t.Fatalf("placeRootTreeMultiLevelHigh: write sb: %v", err)
+	}
+
+	if err := rebuildExtentTree(bfs.rwa, bfs.partOffset, bfs.sb, bfs.sm); err != nil {
+		t.Fatalf("placeRootTreeMultiLevelHigh: rebuild extent tree: %v", err)
+	}
+	bfs.invalidateCache()
+	return nodeLog
+}
+
 // setRootItemLevel rewrites the `level` byte of the ROOT_ITEM (objID, ROOT_ITEM,
 // 0) in the root-tree leaf — a test-only surgical edit used when a fixture turns
 // a tree multi-level so the kernel's ROOT_ITEM.level ↔ root-node-level cross-check

@@ -3,6 +3,7 @@ package filesystem_btrfs
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -493,6 +494,80 @@ func TestRelocMeta_MultiLevelKernelOracle(t *testing.T) {
 		}
 	}
 	placeTreeMultiLevelHigh(t, bfs, devTreeObjID, 21*1024*1024, 20*1024*1024)
+	if err := bfs.Shrink(18 * 1024 * 1024); err != nil {
+		t.Fatalf("Shrink: %v", err)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	kernelCheckAndMount(t, dir, img, files)
+}
+
+// TestMultiLevelExtentTree_KernelOracle is the real kernel oracle for the
+// multi-level EXTENT_TREE rebuild: enough distinct-extent files are written to
+// overflow a single 4 KiB extent leaf (so rebuildExtentTree emits a genuine
+// multi-level extent tree), then the image is Shrunk so the whole extent tree is
+// reconstructed below the new size. `btrfs check` must be clean and the kernel
+// must mount it with every file byte-identical. Root + btrfs-progs gated.
+//
+// VM-validated 2026-06-23 in cb-tpm-ubuntu (btrfs-progs v6.6.3, kernel 6.17):
+// `btrfs check` "no error found" + loop-mount, all 200/150 files byte-identical.
+func TestMultiLevelExtentTree_KernelOracle(t *testing.T) {
+	requireKernelOracle(t)
+	dir := t.TempDir()
+	img := filepath.Join(dir, "ml-extent-oracle.img")
+	fs, err := Format(img, 64*1024*1024, FormatConfig{Label: "mlextoracle"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	files := map[string][]byte{}
+	for i := 0; i < 150; i++ {
+		name := fmt.Sprintf("/f%04d.bin", i)
+		body := bytes.Repeat([]byte(fmt.Sprintf("E%04d-", i)), 4096/6+1)[:4096]
+		if err := fs.WriteFile(name, body, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		files[name] = body
+	}
+	if lvl := extentTreeLevel(t, fs.(*btrfsFS)); lvl == 0 {
+		t.Fatalf("extent tree single-leaf; expected multi-level")
+	}
+	r, err := Open(img, -1)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := r.Shrink(48 * 1024 * 1024); err != nil {
+		t.Fatalf("Shrink: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	kernelCheckAndMount(t, dir, img, files)
+}
+
+// TestMultiLevelRootTree_KernelOracle is the real kernel oracle for relocating a
+// multi-level ROOT_TREE whose ROOT_ITEM leaf sits in the removed tail: the leaf
+// (and its interior parent) must be COW-moved low, the superblock `root` pointer
+// re-seated, and the result `btrfs check`-clean and kernel-mountable. Gated.
+func TestMultiLevelRootTree_KernelOracle(t *testing.T) {
+	requireKernelOracle(t)
+	dir := t.TempDir()
+	img := filepath.Join(dir, "ml-root-oracle.img")
+	fs, err := Format(img, 24*1024*1024, FormatConfig{Label: "mlrootoracle"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	bfs := fs.(*btrfsFS)
+	files := map[string][]byte{
+		"/keep.bin":  bytes.Repeat([]byte("KEEP-ALIGNED-"), 256*48),
+		"/small.txt": []byte("root tree multi-level\n"),
+	}
+	for name, data := range files {
+		if err := fs.WriteFile(name, data, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	placeRootTreeMultiLevelHigh(t, bfs, 21*1024*1024, 20*1024*1024)
 	if err := bfs.Shrink(18 * 1024 * 1024); err != nil {
 		t.Fatalf("Shrink: %v", err)
 	}

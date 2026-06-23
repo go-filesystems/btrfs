@@ -19,9 +19,15 @@ import (
 // free site, we recompute the EXTENT_TREE from the live trees at the end of each
 // write transaction (rebuildExtentTree, invoked from updateFsTreeRoot). The
 // rebuild walks every tree reachable from the current roots, so only live blocks
-// are recorded; freed blocks (old COW copies) are naturally excluded. The fresh
-// extent leaf is written in place at the extent tree's existing location, which
-// keeps it reachable without a recursive allocation.
+// are recorded; freed blocks (old COW copies) are naturally excluded. When the
+// records fit a single leaf it is written in place at the extent tree's existing
+// location (no recursive allocation). When they overflow, or when a shrink
+// dropped the chunk that held the old extent root, the EXTENT_TREE is rebuilt
+// MULTI-LEVEL from the lowest free blocks (see extent_multilevel.go): the records
+// are partitioned across leaves indexed by interior nodes, the extent tree's own
+// self-referential blocks are solved to a fixpoint, the ROOT_ITEM is repointed,
+// and EVERY block of the previous extent tree is freed back to the allocator so
+// successive rebuilds do not leak space.
 
 // extentTreeRoot returns the current logical address of the EXTENT_TREE root,
 // read from the ROOT_TREE.
@@ -35,6 +41,44 @@ func extentTreeRoot(rwaAt readerWriterAt, partOff int64, sb *superblock) (uint64
 		return 0, fmt.Errorf("EXTENT_TREE root item too short")
 	}
 	return binary.LittleEndian.Uint64(d[rootItemOffBytenr:]), nil
+}
+
+// rootItemLeafLogAddr returns the logical address of the ROOT_TREE leaf that
+// holds the ROOT_ITEM (objID, ROOT_ITEM, 0). For a single-leaf root tree this is
+// sb.rootLogAddr; for a multi-level root tree it descends via tracePath to the
+// leaf where that key lives. In-place edits of a ROOT_ITEM keep the leaf at its
+// current logical address, so callers can rewrite it without COWing the root tree.
+func rootItemLeafLogAddr(rwaAt readerWriterAt, partOff int64, sb *superblock, objID uint64) (uint64, error) {
+	rootBuf, err := readNode(rwaAt, partOff, sb, sb.rootLogAddr)
+	if err != nil {
+		return 0, fmt.Errorf("read root tree root: %w", err)
+	}
+	if parseNodeHeader(rootBuf).level == 0 {
+		return sb.rootLogAddr, nil
+	}
+	path, err := tracePath(rwaAt, partOff, sb, sb.rootLogAddr, key{objID, typeRootItem, 0})
+	if err != nil {
+		return 0, fmt.Errorf("trace root item %d: %w", objID, err)
+	}
+	return path[len(path)-1].logAddr, nil
+}
+
+// extentHeaderTemplate synthesizes an EXTENT_TREE node-header template
+// (fsid, chunk_tree_uuid, flags, owner) from a reachable node — the ROOT_TREE
+// root, always low and in-bounds — with the owner field set to EXTENT_TREE. Used
+// when the old extent root block is no longer reachable (a shrink dropped the
+// chunk that held it), so the rebuilt extent tree's blocks still carry correct
+// fsid / chunk_tree_uuid / backref-revision bytes. Returns a node-size buffer
+// whose item area is empty.
+func extentHeaderTemplate(rwaAt readerWriterAt, partOff int64, sb *superblock) ([]byte, error) {
+	src, err := readNode(rwaAt, partOff, sb, sb.rootLogAddr)
+	if err != nil {
+		return nil, fmt.Errorf("read root tree for extent header template: %w", err)
+	}
+	buf := make([]byte, sb.nodeSize)
+	copy(buf[:nodeHdrSize], src[:nodeHdrSize])
+	binary.LittleEndian.PutUint64(buf[0x58:], extentTreeObjID) // owner = EXTENT_TREE
+	return buf, nil
 }
 
 // metaBlock is one live tree block: its logical address, owning tree, and node
@@ -129,14 +173,23 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 		}
 		return 0, false
 	}
+	// baseBGUsed accumulates per-block-group `used` for everything EXCEPT the
+	// extent tree's own blocks. The multi-level rebuild adds the new extent-tree
+	// blocks' contribution itself (their count is solved to a fixpoint); the
+	// single-leaf path adds the lone extent leaf below.
+	baseBGUsed := map[uint64]uint64{}
 	for _, b := range blocks {
 		if cs, ok := chunkOf(b.logAddr); ok {
 			bgUsed[cs] += uint64(sb.nodeSize)
+			if b.owner != extentTreeObjID {
+				baseBGUsed[cs] += uint64(sb.nodeSize)
+			}
 		}
 	}
 	for _, de := range dataExtents {
 		if cs, ok := chunkOf(de.logAddr); ok {
 			bgUsed[cs] += de.length
+			baseBGUsed[cs] += de.length
 		}
 	}
 
@@ -144,10 +197,6 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 	// (logical, type, size): for each metadata block a METADATA_ITEM(0xA9,
 	// offset 0); for each data extent an EXTENT_ITEM(0xA8, offset length); and
 	// for each block group a BLOCK_GROUP_ITEM(0xC0, offset chunk size).
-	type itemRec struct {
-		k    key
-		data []byte
-	}
 	le := binary.LittleEndian
 	var recs []itemRec
 	for _, b := range blocks {
@@ -168,30 +217,80 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 		return compareKeys(recs[i].k, recs[j].k.objID, recs[j].k.typ, recs[j].k.offset) < 0
 	})
 
-	// Write the rebuilt leaf in place at the extent tree's current location.
+	// Header template (fsid, chunk_tree_uuid, flags, owner). Read it from the
+	// extent root when that block is still reachable; otherwise — e.g. during a
+	// shrink that dropped the chunk holding the old extent root — synthesize it
+	// from a reachable node (the root tree) with owner reset to EXTENT_TREE.
 	leaf := make([]byte, sb.nodeSize)
-	// Preserve the header (fsid, chunk_tree_uuid, flags, owner) from the existing
-	// extent leaf so backref-rev / owner stay correct; reset nritems to 0.
-	phys, err := sb.physAddr(partOff, extRoot)
-	if err != nil {
-		return fmt.Errorf("locate extent leaf: %w", err)
+	extRootSafe := false
+	if phys, perr := sb.physAddr(partOff, extRoot); perr == nil {
+		if _, rerr := rwaAt.ReadAt(leaf, phys); rerr == nil {
+			extRootSafe = true
+		}
 	}
-	if _, err := rwaAt.ReadAt(leaf, phys); err != nil {
-		return fmt.Errorf("read extent leaf: %w", err)
+	if !extRootSafe {
+		tpl, terr := extentHeaderTemplate(rwaAt, partOff, sb)
+		if terr != nil {
+			return terr
+		}
+		leaf = tpl
 	}
 	le.PutUint32(leaf[0x60:], 0)               // nritems = 0
 	le.PutUint64(leaf[0x50:], sb.generation+1) // generation
 	leaf[0x64] = 0                             // level 0
+	overflow := false
 	for _, r := range recs {
 		if err := leafInsertItem(leaf, r.k, r.data); err != nil {
-			// The single-leaf extent tree overflowed (the writer does not yet
-			// grow the extent tree to multiple leaves). Skip the rebuild and
-			// leave the prior extent tree in place: the filesystem stays
-			// mountable, only `btrfs check` extent accounting may lag. This only
-			// affects images with hundreds of extents — well beyond the
-			// file-injection use case the writer targets.
-			return nil
+			overflow = true
+			break
 		}
+	}
+	if overflow || !extRootSafe {
+		// Either the records do not fit in a single extent leaf (grow to a
+		// multi-level tree), OR the old single extent root is no longer reachable
+		// because a shrink dropped the chunk holding it (relocate it to a fresh low
+		// block). Both are handled by rebuilding the EXTENT_TREE from the lowest
+		// free blocks: the records are partitioned across one or more leaves indexed
+		// by interior nodes, all freshly allocated low (so a shrink relocation keeps
+		// them out of the removed tail). The extent tree's own new blocks are
+		// themselves METADATA_ITEMs, so the record set and per-block-group `used`
+		// are solved to a fixpoint. See buildMultiLevelExtentTree (a single relocated
+		// leaf is its degenerate blockCount==1 case).
+		//
+		// baseRecs excludes the old extent-tree-owned METADATA_ITEM(s) and the
+		// BLOCK_GROUP_ITEMs (whose `used` depends on the new extent-tree block
+		// count); the builder re-emits the extent-tree blocks and the block groups
+		// inside the fixpoint.
+		var baseRecs []itemRec
+		extentOwned := map[uint64]bool{}
+		for _, b := range blocks {
+			if b.owner == extentTreeObjID {
+				extentOwned[b.logAddr] = true
+			}
+		}
+		for _, r := range recs {
+			if r.k.typ == typeBlockGroupItem {
+				continue
+			}
+			if r.k.typ == typeMetadataItem && extentOwned[r.k.objID] {
+				continue
+			}
+			baseRecs = append(baseRecs, r)
+		}
+		in := multiLevelExtentInput{
+			baseRecs:    baseRecs,
+			baseBGUsed:  baseBGUsed,
+			bgLenFlags:  bgLenFlags,
+			chunkOf:     chunkOf,
+			oldExtRoot:  extRoot,
+			oldExtSafe:  extRootSafe,
+			hdrTemplate: leaf, // header template (fsid, chunk_tree_uuid, owner)
+		}
+		return buildMultiLevelExtentTree(rwaAt, partOff, sb, sm, in)
+	}
+	phys, err := sb.physAddr(partOff, extRoot)
+	if err != nil {
+		return fmt.Errorf("locate extent leaf: %w", err)
 	}
 	updateNodeCRC(leaf)
 	if _, err := rwaAt.WriteAt(leaf, phys); err != nil {
@@ -222,7 +321,16 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 // the correct transaction generation) by the FS-tree update, so an in-place
 // edit of one field keeps the whole commit consistent.
 func updateExtentRootGeneration(rwaAt readerWriterAt, partOff int64, sb *superblock, extRoot uint64) error {
-	phys, err := sb.physAddr(partOff, sb.rootLogAddr)
+	// Locate the ROOT_TREE leaf carrying the EXTENT_TREE's ROOT_ITEM. For a
+	// single-leaf root tree this is sb.rootLogAddr; for a multi-level root tree
+	// descend via tracePath so the in-place generation/bytenr edit lands in the
+	// correct leaf (the parents' key-ptrs stay valid because the leaf keeps its
+	// logical address).
+	leafLog, err := rootItemLeafLogAddr(rwaAt, partOff, sb, extentTreeObjID)
+	if err != nil {
+		return err
+	}
+	phys, err := sb.physAddr(partOff, leafLog)
 	if err != nil {
 		return fmt.Errorf("locate root tree leaf: %w", err)
 	}
@@ -232,9 +340,7 @@ func updateExtentRootGeneration(rwaAt readerWriterAt, partOff int64, sb *superbl
 	}
 	hdr := parseNodeHeader(leaf)
 	if hdr.level != 0 {
-		// Multi-level root tree (very large fs): fall back silently — the extent
-		// leaf generation already matches the prior ROOT_ITEM in the common case.
-		return nil
+		return fmt.Errorf("ROOT_ITEM leaf 0x%X is not a leaf", leafLog)
 	}
 	idx := findItemIdx(leaf, extentTreeObjID, typeRootItem, 0)
 	if idx < 0 {

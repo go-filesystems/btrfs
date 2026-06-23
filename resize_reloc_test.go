@@ -134,19 +134,59 @@ func TestReloc_RuntimeShrink(t *testing.T) {
 	}
 }
 
-// TestReloc_RefusesEntireChunkRemoval asserts the clear-error boundary when a
-// shrink would remove the whole trailing chunk (chunk relocation is out of
-// scope).
+// TestReloc_RefusesEntireChunkRemoval asserts the capacity boundary when a
+// shrink would remove the whole trailing chunk but its live contents cannot fit
+// in the (tiny SYSTEM) chunk below: non-empty whole-chunk relocation is now
+// implemented, so the refusal is the honest "no room below the new size" one,
+// not an out-of-scope error. The image must stay readable at its old size.
 func TestReloc_RefusesEntireChunkRemoval(t *testing.T) {
 	fs, _ := resizeTempImage(t, 16*1024*1024)
 	// The DATA chunk starts at 5 MiB; shrinking to <= 5 MiB removes it whole.
+	// This sole DATA|METADATA chunk holds every metadata block; the only lower
+	// chunk is the small SYSTEM chunk, which has no room to receive them, so the
+	// relocation refuses for lack of free space below the new size.
 	err := fs.Shrink(5 * 1024 * 1024)
 	if err == nil {
 		t.Fatal("Shrink removing entire trailing chunk accepted; want error")
 	}
-	if !strings.Contains(err.Error(), "chunk relocation not supported") &&
+	if !strings.Contains(err.Error(), "no free") &&
+		!strings.Contains(err.Error(), "not empty") &&
 		!strings.Contains(err.Error(), "below minimum") {
-		t.Errorf("expected chunk-relocation boundary error, got: %v", err)
+		t.Errorf("expected chunk-relocation capacity boundary error, got: %v", err)
+	}
+}
+
+// TestRemoveChunk_NonEmptyRollback drops a non-empty trailing chunk that also
+// carries an unrelocatable metadata block (a genuine two-level EXTENT tree node)
+// inside it, so relocateNonEmptyChunkLocked refuses mid-way and rolls the evicted
+// chunk range back — leaving the image readable at its original size. Exercises
+// the freeRange rollback path of the whole-chunk relocation.
+func TestRemoveChunk_NonEmptyRollback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nerollback.img")
+	fs, err := Format(path, 16*1024*1024, FormatConfig{Label: "neroll"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	bfs := fs.(*btrfsFS)
+	payload := bytes.Repeat([]byte("KEEP-ALIGNED-"), 256*8)
+	if err := fs.WriteFile("/keep.bin", payload, 0o644); err != nil {
+		t.Fatalf("keep: %v", err)
+	}
+	// Append a non-empty trailing DATA chunk holding a live file.
+	tail := bytes.Repeat([]byte("TAIL-ALIGNED-"), 256*8)
+	newChunkLog := appendDataChunkWithLiveExtent(t, bfs, 8*1024*1024, "/tail.bin", tail)
+	// Make the EXTENT tree two-level with a node placed inside the trailing chunk
+	// (>= newChunkLog), so the whole-chunk relocation hits the unrelocatable
+	// extent node and must roll back.
+	placeTreeMultiLevelHigh(t, bfs, extentTreeObjID, newChunkLog+2*1024*1024, newChunkLog+1*1024*1024)
+
+	if err := bfs.Shrink(int64(newChunkLog)); err == nil ||
+		!strings.Contains(err.Error(), "multi-level") {
+		t.Errorf("expected unrelocatable-metadata refusal on whole-chunk drop, got: %v", err)
+	}
+	// Image must remain readable at its original size.
+	if got, rerr := fs.ReadFile("/keep.bin"); rerr != nil || !bytes.Equal(got, payload) {
+		t.Errorf("after refused chunk drop /keep.bin mismatch: err=%v len=%d", rerr, len(got))
 	}
 }
 

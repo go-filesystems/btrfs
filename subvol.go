@@ -43,6 +43,7 @@ const (
 	rootItemOffGeneration   = 0xA0 // __le64 generation
 	rootItemOffRootDirID    = 0xA8 // __le64 root_dirid
 	rootItemOffBytenr       = 0xB0 // __le64 bytenr (root node logical addr)
+	rootItemOffLevel        = 0xEE // __u8   level (height of the root node)
 	rootItemOffGenerationV2 = 0xEF // __le64 generation_v2 (must equal generation)
 	rootItemMinSize         = rootItemOffBytenr + 8
 

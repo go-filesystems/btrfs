@@ -20,11 +20,13 @@ func TestRemoveChunk_RefusesOnlyChunk(t *testing.T) {
 	if err == nil {
 		t.Fatal("Shrink dropping the only data chunk accepted; want refusal")
 	}
-	// The sole DATA|METADATA chunk holds every metadata block, so the removal is
-	// refused as non-empty (it is anchored by the SYSTEM chunk that ends at
-	// 5 MiB, so the "no chunk reaching its tail" branch is not the one that
-	// fires here). Either refusal is a correct, image-preserving boundary.
-	if !strings.Contains(err.Error(), "not empty") &&
+	// The sole DATA|METADATA chunk holds every metadata block; it is anchored by
+	// the SYSTEM chunk that ends at 5 MiB, but that small chunk has no room to
+	// receive the relocated metadata, so non-empty whole-chunk relocation refuses
+	// for lack of free space below the new size. Any of these is a correct,
+	// image-preserving boundary.
+	if !strings.Contains(err.Error(), "no free") &&
+		!strings.Contains(err.Error(), "not empty") &&
 		!strings.Contains(err.Error(), "no chunk reaching its tail") &&
 		!strings.Contains(err.Error(), "below minimum") &&
 		!strings.Contains(err.Error(), "below bytes_used") {
@@ -57,10 +59,12 @@ func TestRemoveChunk_RefusesPartialDrop(t *testing.T) {
 	}
 }
 
-// TestRemoveChunk_RefusesNonEmptyDirect marks the appended trailing chunk's
-// BLOCK_GROUP_ITEM with a non-zero `used` and asserts the evacuability check
-// refuses its removal.
-func TestRemoveChunk_RefusesNonEmptyDirect(t *testing.T) {
+// TestRemoveChunk_NonEmptyUsedFlagCorrected marks the appended trailing chunk's
+// BLOCK_GROUP_ITEM with a non-zero `used` even though it holds no live extent.
+// chunkIsEvacuableLocked sees it as occupied (so the non-empty path is taken),
+// but the relocation pass finds nothing to move and the extent-tree rebuild
+// recomputes `used` back to 0, so the now-empty chunk is removed cleanly.
+func TestRemoveChunk_NonEmptyUsedFlagCorrected(t *testing.T) {
 	path := t.TempDir() + "/ne.img"
 	fs, err := Format(path, 16*1024*1024, FormatConfig{Label: "ne"})
 	if err != nil {
@@ -84,9 +88,7 @@ func TestRemoveChunk_RefusesNonEmptyDirect(t *testing.T) {
 	idx := findItemIdx(leaf, newChunkLog, typeBlockGroupItem, 8*1024*1024)
 	items := parseLeafItems(leaf, parseNodeHeader(leaf).nItems)
 	d := items[idx].data(leaf)
-	for i := 0; i < 8; i++ {
-		d[i] = 0xFF // used = huge
-	}
+	binary.LittleEndian.PutUint64(d[0:], 4096) // used = nonzero (but no live extent)
 	updateNodeCRC(leaf)
 	if _, err := bfs.rwa.WriteAt(leaf, phys); err != nil {
 		bfs.mu.Unlock()
@@ -99,8 +101,11 @@ func TestRemoveChunk_RefusesNonEmptyDirect(t *testing.T) {
 	}
 	err = bfs.removeWholeTrailingChunkLocked(idxChunk, newChunkLog)
 	bfs.mu.Unlock()
-	if err == nil || !strings.Contains(err.Error(), "not empty") {
-		t.Errorf("expected non-empty chunk refusal, got: %v", err)
+	if err != nil {
+		t.Fatalf("non-empty (flag-only) chunk removal failed: %v", err)
+	}
+	if got := bfs.sb.totalBytes; got != newChunkLog {
+		t.Errorf("post-removal total_bytes = %d, want %d", got, newChunkLog)
 	}
 }
 
@@ -139,36 +144,28 @@ func TestRelocMeta_RefusesMultiLevelRoot(t *testing.T) {
 	}
 }
 
-// TestRelocMeta_RefusesMultiLevelNonFSTree flips a non-FS tree root (csum) to
-// look multi-level and asserts relocateTailMetadata refuses relocating it.
-func TestRelocMeta_RefusesMultiLevelNonFSTree(t *testing.T) {
-	path := t.TempDir() + "/mlnonfs.img"
-	fs, err := Format(path, 24*1024*1024, FormatConfig{Label: "mlnonfs"})
+// TestRelocMeta_RefusesMultiLevelExtentTree builds a genuine two-level EXTENT
+// tree with a node in the tail and asserts relocateTailMetadata refuses it: the
+// extent tree's own nodes cannot be relocated while rebuildExtentTree rewrites
+// its leaf in place under a single-leaf assumption. The image is left consistent.
+func TestRelocMeta_RefusesMultiLevelExtentTree(t *testing.T) {
+	path := t.TempDir() + "/mlext.img"
+	fs, err := Format(path, 24*1024*1024, FormatConfig{Label: "mlext"})
 	if err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	bfs := fs.(*btrfsFS)
-	if err := fs.WriteFile("/x", []byte("x"), 0o644); err != nil {
+	if err := fs.WriteFile("/x", bytes.Repeat([]byte("x"), 4096), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	// Place the csum tree root high, then corrupt its level to 1 in place.
-	highLog := placeTreeRootHigh(t, bfs, csumTreeObjID, 20*1024*1024)
+	// Make the EXTENT tree genuinely two-level with its interior node high in the
+	// [18,24) MiB tail.
+	placeTreeMultiLevelHigh(t, bfs, extentTreeObjID, 21*1024*1024, 20*1024*1024)
 	bfs.mu.Lock()
 	defer bfs.mu.Unlock()
-	phys := physFromLog(bfs.sb, highLog)
-	buf := make([]byte, bfs.sb.nodeSize)
-	if _, err := bfs.rwa.ReadAt(buf, bfs.partOffset+int64(phys)); err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	buf[0x64] = 1 // level = 1
-	updateNodeCRC(buf)
-	if _, err := bfs.rwa.WriteAt(buf, bfs.partOffset+int64(phys)); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	bfs.invalidateCache()
 	err = bfs.relocateTailMetadata(18*1024*1024, 24*1024*1024)
-	if err == nil || !strings.Contains(err.Error(), "multi-level root not supported") {
-		t.Errorf("expected multi-level non-FS-tree refusal, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "multi-level extent tree") {
+		t.Errorf("expected multi-level extent-tree refusal, got: %v", err)
 	}
 }
 
@@ -200,9 +197,10 @@ func TestRepointRootItem_WriteFault(t *testing.T) {
 }
 
 // TestShrink_RefusesUnrelocatableMetadata drives a full Shrink whose tail holds
-// a metadata block that relocation cannot move (a non-FS tree root corrupted to
-// look multi-level), exercising relocateTailExtents' metadata-error propagation
-// and leaving the image readable at its original size.
+// a metadata block that relocation cannot move (a genuine two-level EXTENT tree,
+// whose own nodes the in-place rebuild cannot relocate), exercising
+// relocateTailExtents' metadata-error propagation and leaving the image readable
+// at its original size.
 func TestShrink_RefusesUnrelocatableMetadata(t *testing.T) {
 	path := t.TempDir() + "/unreloc.img"
 	fs, err := Format(path, 24*1024*1024, FormatConfig{Label: "unreloc"})
@@ -214,23 +212,9 @@ func TestShrink_RefusesUnrelocatableMetadata(t *testing.T) {
 	if err := fs.WriteFile("/d.bin", payload, 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	highLog := placeTreeRootHigh(t, bfs, csumTreeObjID, 20*1024*1024)
-	// Corrupt the relocated csum root to look multi-level so relocation refuses.
-	bfs.mu.Lock()
-	phys := physFromLog(bfs.sb, highLog)
-	buf := make([]byte, bfs.sb.nodeSize)
-	if _, err := bfs.rwa.ReadAt(buf, bfs.partOffset+int64(phys)); err != nil {
-		bfs.mu.Unlock()
-		t.Fatalf("read: %v", err)
-	}
-	buf[0x64] = 1
-	updateNodeCRC(buf)
-	if _, err := bfs.rwa.WriteAt(buf, bfs.partOffset+int64(phys)); err != nil {
-		bfs.mu.Unlock()
-		t.Fatalf("write: %v", err)
-	}
-	bfs.invalidateCache()
-	bfs.mu.Unlock()
+	// A real two-level EXTENT tree with its interior node in the tail is the
+	// documented refusal boundary.
+	placeTreeMultiLevelHigh(t, bfs, extentTreeObjID, 21*1024*1024, 20*1024*1024)
 	if err := bfs.Shrink(18 * 1024 * 1024); err == nil ||
 		!strings.Contains(err.Error(), "multi-level") {
 		t.Errorf("expected unrelocatable-metadata refusal, got: %v", err)

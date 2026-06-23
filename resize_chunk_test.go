@@ -75,7 +75,8 @@ func appendEmptyDataChunk(t *testing.T, bfs *btrfsFS, extraLen uint64) uint64 {
 	bg := buildBlockGroupItemBytes(le, 0, blockGroupData)
 	leafInsertItemInPlace(t, bfs, ephys, key{newLog, typeBlockGroupItem, extraLen}, bg)
 
-	// Register the chunk in memory.
+	// Register the chunk in memory. Include the single local stripe so the device
+	// pool can read from / write to this chunk (relocation needs this).
 	bfs.sb.sysChunks = append(bfs.sb.sysChunks, chunkMapping{
 		logStart:       newLog,
 		size:           extraLen,
@@ -84,6 +85,7 @@ func appendEmptyDataChunk(t *testing.T, bfs *btrfsFS, extraLen uint64) uint64 {
 		profile:        blockGroupData,
 		stripeLen:      fmtStripeLen,
 		subStripes:     1,
+		stripes:        []chunkStripe{{devID: bfs.sb.devID, offset: newLog}},
 	})
 	if bfs.sm != nil {
 		bfs.sm.freeRange(newLog, extraLen)
@@ -96,6 +98,136 @@ func appendEmptyDataChunk(t *testing.T, bfs *btrfsFS, extraLen uint64) uint64 {
 	bfs.sb.totalBytes = newTotal
 	bfs.invalidateCache()
 	return newLog
+}
+
+// appendDataChunkWithLiveExtent appends an empty DATA chunk (via
+// appendEmptyDataChunk), writes `payload` to `name` in the lower chunk, then
+// SURGICALLY relocates that file's data extent UP into the new trailing chunk —
+// the inverse of a shrink — so the trailing chunk becomes genuinely non-empty
+// with a live, reachable file extent. It rewrites the EXTENT_DATA disk_bytenr in
+// the FS leaf in place (no gen bump), copies the bytes to the new chunk, fixes
+// the space manager, marks the new chunk's BLOCK_GROUP_ITEM `used`, and rebuilds
+// the extent tree so the starting image is `btrfs check`-clean. Returns the new
+// chunk's logical start.
+func appendDataChunkWithLiveExtent(t *testing.T, bfs *btrfsFS, extraLen uint64, name string, payload []byte) uint64 {
+	t.Helper()
+	newChunkLog := appendEmptyDataChunk(t, bfs, extraLen)
+	if err := bfs.WriteFile(name, payload, 0o644); err != nil {
+		t.Fatalf("appendDataChunkWithLiveExtent: write %s: %v", name, err)
+	}
+
+	bfs.mu.Lock()
+	defer bfs.mu.Unlock()
+	le := binary.LittleEndian
+
+	in, err := pathLookup(bfs.reader(), bfs.partOffset, bfs.sb, bfs.fsTreeRoot, name)
+	if err != nil {
+		t.Fatalf("appendDataChunkWithLiveExtent: lookup %s: %v", name, err)
+	}
+	ino := in.num
+
+	// Walk the FS tree, find this inode's regular EXTENT_DATA items, and move each
+	// extent into the new chunk. Track the running allocation offset within it.
+	dst := newChunkLog
+	moved := uint64(0)
+	err = walkLeavesWithPhys(bfs.rwa, bfs.partOffset, bfs.sb, bfs.fsTreeRoot, func(buf []byte, phys int64) (bool, error) {
+		dirty := false
+		items := parseLeafItems(buf, parseNodeHeader(buf).nItems)
+		for _, it := range items {
+			if it.k.objID != ino || it.k.typ != typeExtentData {
+				continue
+			}
+			ed := it.data(buf)
+			if len(ed) < extDataRegularSize || ed[extDataOffType] != extentDataRegular {
+				continue
+			}
+			oldDisk := le.Uint64(ed[extDataOffDiskBytenr:])
+			diskBytes := le.Uint64(ed[extDataOffDiskNumBytes:])
+			if oldDisk == 0 || diskBytes == 0 {
+				continue
+			}
+			// Reserve dst..dst+diskBytes in the new chunk; copy the bytes.
+			oldPhys := physFromLog(bfs.sb, oldDisk)
+			tmp := make([]byte, diskBytes)
+			if _, err := bfs.rwa.ReadAt(tmp, bfs.partOffset+int64(oldPhys)); err != nil {
+				return false, err
+			}
+			if _, err := bfs.rwa.WriteAt(tmp, bfs.partOffset+int64(dst)); err != nil {
+				return false, err
+			}
+			le.PutUint64(ed[extDataOffDiskBytenr:], physToLog(bfs.sb, dst))
+			dirty = true
+			// Free the old low extent, reserve the new high one.
+			bfs.sm.freeRange(oldPhys, diskBytes)
+			bfs.sm.remove(dst, diskBytes)
+			dst += diskBytes
+			moved += diskBytes
+		}
+		if dirty {
+			updateNodeCRC(buf)
+			if _, err := bfs.rwa.WriteAt(buf, bfs.partOffset+phys); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("appendDataChunkWithLiveExtent: relocate extent: %v", err)
+	}
+	if moved == 0 {
+		t.Fatalf("appendDataChunkWithLiveExtent: no data extent found for %s", name)
+	}
+	bfs.invalidateCache()
+	// Rebuild the extent tree so the new chunk's BLOCK_GROUP_ITEM `used` and the
+	// METADATA/EXTENT items reflect the moved extent — surgical, no gen bump.
+	if err := rebuildExtentTree(bfs.rwa, bfs.partOffset, bfs.sb, bfs.sm); err != nil {
+		t.Fatalf("appendDataChunkWithLiveExtent: rebuild extent tree: %v", err)
+	}
+	bfs.invalidateCache()
+	return newChunkLog
+}
+
+// walkLeavesWithPhys walks every leaf of the tree rooted at logAddr, invoking fn
+// with the leaf buffer and its physical byte offset (relative to partOffset). fn
+// may mutate+write the buffer; returning false stops the walk early. A minimal
+// test-only walker (the production walkLeaves does not expose the physical
+// address). It tolerates read errors on missing nodes.
+func walkLeavesWithPhys(r readerWriterAt, partOff int64, sb *superblock, logAddr uint64, fn func([]byte, int64) (bool, error)) error {
+	var visit func(uint64, int) error
+	visit = func(addr uint64, depth int) error {
+		if depth > maxBtreeDepth {
+			return nil
+		}
+		phys, err := sb.physAddr(partOff, addr)
+		if err != nil {
+			return nil
+		}
+		buf := make([]byte, sb.nodeSize)
+		if _, err := r.ReadAt(buf, phys); err != nil {
+			return nil
+		}
+		hdr := parseNodeHeader(buf)
+		if hdr.level == 0 {
+			_, err := fn(buf, phys-partOff)
+			return err
+		}
+		le := binary.LittleEndian
+		for i := uint32(0); i < hdr.nItems; i++ {
+			off := nodeHdrSize + int(i)*keyPtrSize
+			if off+keyPtrSize > len(buf) {
+				break
+			}
+			child := le.Uint64(buf[off+17:])
+			if child == 0 {
+				continue
+			}
+			if err := visit(child, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return visit(logAddr, 0)
 }
 
 // leafInsertItemInPlace re-reads the single leaf at phys, inserts (k, data) via
@@ -255,4 +387,117 @@ func TestRemoveChunk_KernelOracle(t *testing.T) {
 			t.Fatalf("kernel-mounted %s mismatch: err=%v len=%d want %d", name, err, len(got), len(data))
 		}
 	}
+}
+
+// requireKernelOracle skips unless the test may run the real kernel oracle
+// (non-short, root, btrfs-progs present).
+func requireKernelOracle(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("kernel oracle is slow / needs root+tools; skipped in -short")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("kernel oracle needs root for losetup/mount")
+	}
+	for _, bin := range []string{"btrfs", "mount", "umount", "losetup"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not on PATH; skipping kernel oracle", bin)
+		}
+	}
+}
+
+// kernelCheckAndMount runs `btrfs check` on img (asserting clean) then loop-mounts
+// it read-only and verifies every file in want is byte-identical.
+func kernelCheckAndMount(t *testing.T, dir, img string, want map[string][]byte) {
+	t.Helper()
+	out, err := exec.Command("btrfs", "check", img).CombinedOutput()
+	if err != nil {
+		t.Fatalf("btrfs check failed: %v\n%s", err, out)
+	}
+	if bytes.Contains(out, []byte("ERROR")) || bytes.Contains(out, []byte("error(s) found")) {
+		t.Fatalf("btrfs check reported errors:\n%s", out)
+	}
+	loopOut, err := exec.Command("losetup", "--find", "--show", img).CombinedOutput()
+	if err != nil {
+		t.Fatalf("losetup: %v\n%s", err, loopOut)
+	}
+	loop := strings.TrimSpace(string(loopOut))
+	defer exec.Command("losetup", "-d", loop).Run()
+	mnt := filepath.Join(dir, "mnt")
+	if err := os.MkdirAll(mnt, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if mout, err := exec.Command("mount", "-o", "ro", loop, mnt).CombinedOutput(); err != nil {
+		t.Fatalf("mount: %v\n%s", err, mout)
+	}
+	defer exec.Command("umount", mnt).Run()
+	for name, data := range want {
+		got, err := os.ReadFile(filepath.Join(mnt, strings.TrimPrefix(name, "/")))
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("kernel-mounted %s mismatch: err=%v len=%d want %d", name, err, len(got), len(data))
+		}
+	}
+}
+
+// TestRemoveChunk_NonEmptyKernelOracle is the real kernel oracle for NON-empty
+// whole-chunk relocation: a 2-data-chunk image whose trailing chunk holds a live
+// file is shrunk so that whole chunk drops — its contents must relocate into the
+// lower chunk and the chunk be removed — then `btrfs check` must be clean and the
+// kernel must mount it with every file byte-identical. Root + btrfs-progs gated.
+func TestRemoveChunk_NonEmptyKernelOracle(t *testing.T) {
+	requireKernelOracle(t)
+	dir := t.TempDir()
+	img := filepath.Join(dir, "ne-oracle.img")
+	fs, err := Format(img, 16*1024*1024, FormatConfig{Label: "neoracle"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	bfs := fs.(*btrfsFS)
+	files := map[string][]byte{
+		"/keep.bin": bytes.Repeat([]byte("KEEP-ALIGNED-"), 256*32),
+		"/tail.bin": bytes.Repeat([]byte("RELOC-ME-ALIGNED-"), 256*16),
+	}
+	if err := fs.WriteFile("/keep.bin", files["/keep.bin"], 0o644); err != nil {
+		t.Fatalf("keep: %v", err)
+	}
+	newChunkLog := appendDataChunkWithLiveExtent(t, bfs, 8*1024*1024, "/tail.bin", files["/tail.bin"])
+	if err := bfs.Shrink(int64(newChunkLog)); err != nil {
+		t.Fatalf("Shrink: %v", err)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	kernelCheckAndMount(t, dir, img, files)
+}
+
+// TestRelocMeta_MultiLevelKernelOracle is the real kernel oracle for multi-level
+// interior metadata relocation: a genuine two-level DEV tree with its interior
+// node and one child leaf in the removed tail is shrunk, then `btrfs check` must
+// be clean and the kernel must mount it with every file intact. Gated.
+func TestRelocMeta_MultiLevelKernelOracle(t *testing.T) {
+	requireKernelOracle(t)
+	dir := t.TempDir()
+	img := filepath.Join(dir, "ml-oracle.img")
+	fs, err := Format(img, 24*1024*1024, FormatConfig{Label: "mloracle"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	bfs := fs.(*btrfsFS)
+	files := map[string][]byte{
+		"/keep.bin":  bytes.Repeat([]byte("KEEP-ALIGNED-"), 256*48),
+		"/small.txt": []byte("small file body\n"),
+	}
+	for name, data := range files {
+		if err := fs.WriteFile(name, data, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	placeTreeMultiLevelHigh(t, bfs, devTreeObjID, 21*1024*1024, 20*1024*1024)
+	if err := bfs.Shrink(18 * 1024 * 1024); err != nil {
+		t.Fatalf("Shrink: %v", err)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	kernelCheckAndMount(t, dir, img, files)
 }

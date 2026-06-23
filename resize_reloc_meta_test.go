@@ -35,6 +35,21 @@ var shrunkMetaRelocFixture []byte
 //go:embed testdata/resize/shrunk-chunk-removal.img.zst
 var shrunkChunkRemovalFixture []byte
 
+// shrunkMultiLevelRelocFixture is a 24→18 MiB image whose removed tail held a
+// genuine TWO-level DEV tree (interior node + a child leaf); Shrink path-COW-
+// relocated the subtree below the new size. `btrfs check`-clean and kernel-
+// mountable on cb-tpm-ubuntu (kernel 6.17 / btrfs-progs 6.6.3).
+//
+//go:embed testdata/resize/shrunk-multilevel-reloc.img.zst
+var shrunkMultiLevelRelocFixture []byte
+
+// shrunkNonEmptyChunkRelocFixture is a 16 MiB image with a second NON-empty DATA
+// chunk holding /tail.bin; Shrink dropped that whole chunk, relocating its live
+// content into the lower chunk. `btrfs check`-clean and kernel-mountable (same VM).
+//
+//go:embed testdata/resize/shrunk-nonempty-chunk-reloc.img.zst
+var shrunkNonEmptyChunkRelocFixture []byte
+
 var (
 	metaFixtureKeep  = bytes.Repeat([]byte("FIXTURE-KEEP-"), 256*16)
 	metaFixtureSmall = []byte("small fixture body\n")
@@ -108,11 +123,59 @@ func buildChunkRemovalFixtureImage(t *testing.T, path string) {
 	}
 }
 
-// TestGenerateFixtures (gated by FIXTURE_OUT) writes the two post-shrink fixture
-// images to ${FIXTURE_OUT}/shrunk-meta-reloc.img and
-// ${FIXTURE_OUT}/shrunk-chunk-removal.img. Run under root in the validation VM
-// so the emitted images are exactly the ones `btrfs check` blesses; the raw
-// images are then zstd-compressed and committed under testdata/resize/.
+// buildMultiLevelRelocFixtureImage writes a deterministic post-multi-level-
+// metadata-reloc image: a 24→18 MiB shrink whose removed tail held a genuine
+// two-level DEV tree (interior node + one child leaf), path-COW-relocated down.
+func buildMultiLevelRelocFixtureImage(t *testing.T, path string) {
+	fs, err := Format(path, 24*1024*1024, FormatConfig{Label: "mlfix"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	bfs := fs.(*btrfsFS)
+	if err := fs.WriteFile("/keep.bin", metaFixtureKeep, 0o644); err != nil {
+		t.Fatalf("keep: %v", err)
+	}
+	if err := fs.WriteFile("/small.txt", metaFixtureSmall, 0o644); err != nil {
+		t.Fatalf("small: %v", err)
+	}
+	placeTreeMultiLevelHigh(t, bfs, devTreeObjID, 21*1024*1024, 20*1024*1024)
+	if err := bfs.Shrink(18 * 1024 * 1024); err != nil {
+		t.Fatalf("Shrink: %v", err)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// buildNonEmptyChunkRelocFixtureImage writes a deterministic post-non-empty-
+// chunk-relocation image: a 2-data-chunk 16→? image whose non-empty trailing
+// chunk was dropped, relocating its live /tail.bin into the lower chunk.
+func buildNonEmptyChunkRelocFixtureImage(t *testing.T, path string) {
+	fs, err := Format(path, 16*1024*1024, FormatConfig{Label: "nechunkfix"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	bfs := fs.(*btrfsFS)
+	if err := fs.WriteFile("/keep.bin", metaFixtureKeep, 0o644); err != nil {
+		t.Fatalf("keep: %v", err)
+	}
+	newChunkLog := appendDataChunkWithLiveExtent(t, bfs, 8*1024*1024, "/tail.bin", nonEmptyChunkTailPayload)
+	if err := bfs.Shrink(int64(newChunkLog)); err != nil {
+		t.Fatalf("Shrink: %v", err)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// nonEmptyChunkTailPayload is a sector-aligned (regular, non-inline) body for the
+// non-empty-chunk-relocation fixture's relocated file.
+var nonEmptyChunkTailPayload = bytes.Repeat([]byte("TAIL-RELOC-ALIGNED-"), 256*16)
+
+// TestGenerateFixtures (gated by FIXTURE_OUT) writes the post-shrink fixture
+// images to ${FIXTURE_OUT}/. Run under root in the validation VM so the emitted
+// images are exactly the ones `btrfs check` blesses; the raw images are then
+// zstd-compressed and committed under testdata/resize/.
 func TestGenerateFixtures(t *testing.T) {
 	dir := os.Getenv("FIXTURE_OUT")
 	if dir == "" {
@@ -120,6 +183,8 @@ func TestGenerateFixtures(t *testing.T) {
 	}
 	buildMetaRelocFixtureImage(t, filepath.Join(dir, "shrunk-meta-reloc.img"))
 	buildChunkRemovalFixtureImage(t, filepath.Join(dir, "shrunk-chunk-removal.img"))
+	buildMultiLevelRelocFixtureImage(t, filepath.Join(dir, "shrunk-multilevel-reloc.img"))
+	buildNonEmptyChunkRelocFixtureImage(t, filepath.Join(dir, "shrunk-nonempty-chunk-reloc.img"))
 }
 
 // TestRelocMeta_FixtureReadback opens the committed kernel-blessed
@@ -173,6 +238,56 @@ func TestRemoveChunk_FixtureReadback(t *testing.T) {
 	}
 	if got, err := fs.ReadFile("/small.txt"); err != nil || !bytes.Equal(got, metaFixtureSmall) {
 		t.Errorf("/small.txt mismatch: err=%v got=%q", err, got)
+	}
+}
+
+// TestRelocMeta_MultiLevelFixtureReadback opens the committed kernel-blessed
+// post-multi-level-reloc image with our own reader (every CI arch incl. s390x)
+// and asserts the geometry shrank, no metadata sits in the tail, files survive.
+func TestRelocMeta_MultiLevelFixtureReadback(t *testing.T) {
+	path := decompressZst(t, shrunkMultiLevelRelocFixture)
+	fs, err := Open(path, -1)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer fs.Close()
+	bfs := fs.(*btrfsFS)
+	if got := bfs.sb.totalBytes; got != 18*1024*1024 {
+		t.Errorf("fixture total_bytes = %d, want %d", got, 18*1024*1024)
+	}
+	assertNoMetaAboveLocked(t, bfs, 18*1024*1024)
+	if got, err := fs.ReadFile("/keep.bin"); err != nil || !bytes.Equal(got, metaFixtureKeep) {
+		t.Errorf("/keep.bin mismatch: err=%v len=%d", err, len(got))
+	}
+	if got, err := fs.ReadFile("/small.txt"); err != nil || !bytes.Equal(got, metaFixtureSmall) {
+		t.Errorf("/small.txt mismatch: err=%v got=%q", err, got)
+	}
+}
+
+// TestRemoveChunk_NonEmptyFixtureReadback opens the committed kernel-blessed
+// post-non-empty-chunk-relocation image and asserts the trailing chunk is gone,
+// the device shrank, and both the lower-chunk file and the relocated file survive.
+func TestRemoveChunk_NonEmptyFixtureReadback(t *testing.T) {
+	path := decompressZst(t, shrunkNonEmptyChunkRelocFixture)
+	fs, err := Open(path, -1)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer fs.Close()
+	bfs := fs.(*btrfsFS)
+	for _, m := range bfs.sb.sysChunks {
+		if m.localStripeIdx < 0 {
+			continue
+		}
+		if end := m.physStart + m.size; end > bfs.sb.totalBytes {
+			t.Errorf("chunk at phys 0x%X size %d extends past shrunk device %d", m.physStart, m.size, bfs.sb.totalBytes)
+		}
+	}
+	if got, err := fs.ReadFile("/keep.bin"); err != nil || !bytes.Equal(got, metaFixtureKeep) {
+		t.Errorf("/keep.bin mismatch: err=%v len=%d", err, len(got))
+	}
+	if got, err := fs.ReadFile("/tail.bin"); err != nil || !bytes.Equal(got, nonEmptyChunkTailPayload) {
+		t.Errorf("relocated /tail.bin mismatch: err=%v len=%d", err, len(got))
 	}
 }
 
@@ -276,6 +391,174 @@ func (bfs *btrfsFS) repointRootItemBytenrLocked(objID, newBytenr uint64) error {
 	updateNodeCRC(leaf)
 	_, err = bfs.rwa.WriteAt(leaf, phys)
 	return err
+}
+
+// placeTreeMultiLevelHigh converts the single-leaf non-FS tree identified by
+// objID into a real TWO-level tree and places its interior root node (plus one
+// child leaf) physically high — inside [nodeHighPhys, ...) of the data chunk,
+// i.e. in the region a later shrink must evacuate. It splits the tree's current
+// single leaf into two child leaves (left keeps the first half of the items,
+// right the rest), builds a level-1 interior node with one key-ptr per child
+// (key = the child's first key, blockptr = the child's bytenr, generation = the
+// child header generation), repoints the ROOT_ITEM at the interior node, and
+// rebuilds the extent tree so every new block is accounted. Like
+// placeTreeRootHigh it is a surgical physical layout change at the CURRENT
+// generation (no super.generation bump), so the resulting image is
+// transaction-consistent and `btrfs check`-clean — a valid STARTING image for
+// the multi-level relocation shrink under test.
+//
+// leafHighPhys receives the RIGHT child leaf (also in the tail); the LEFT child
+// leaf is allocated low (below the tail) so the test exercises moving an interior
+// node AND one of its leaves while leaving the sibling in place. The tree must
+// have at least two items in its single leaf (dev tree: DEV_ITEM + DEV_EXTENT;
+// csum/uuid after seeding). Returns the interior node's logical address.
+func placeTreeMultiLevelHigh(t *testing.T, bfs *btrfsFS, objID, nodeHighPhys, leafHighPhys uint64) uint64 {
+	t.Helper()
+	bfs.mu.Lock()
+	defer bfs.mu.Unlock()
+	le := binary.LittleEndian
+
+	// Resolve the tree's current single-leaf root.
+	buf, it, err := searchTree(bfs.rwa, bfs.partOffset, bfs.sb, bfs.sb.rootLogAddr, objID, typeRootItem, 0)
+	if err != nil {
+		t.Fatalf("placeTreeMultiLevelHigh: locate ROOT_ITEM %d: %v", objID, err)
+	}
+	oldLog := le.Uint64(it.data(buf)[rootItemOffBytenr:])
+	oldPhys := physFromLog(bfs.sb, oldLog)
+	leaf := make([]byte, bfs.sb.nodeSize)
+	if _, err := bfs.rwa.ReadAt(leaf, bfs.partOffset+int64(oldPhys)); err != nil {
+		t.Fatalf("placeTreeMultiLevelHigh: read leaf: %v", err)
+	}
+	hdr := parseNodeHeader(leaf)
+	if hdr.level != 0 {
+		t.Fatalf("placeTreeMultiLevelHigh: tree %d is not single-leaf (level %d)", objID, hdr.level)
+	}
+	n := int(hdr.nItems)
+	if n < 2 {
+		t.Fatalf("placeTreeMultiLevelHigh: tree %d has %d items, need >=2 to split", objID, n)
+	}
+	splitAt := n / 2
+
+	// Build the LEFT child = copy of the leaf with the upper items deleted; the
+	// RIGHT child = copy with the lower items deleted. leafDeleteItem keeps the
+	// kernel's contiguous-data invariant.
+	left := make([]byte, bfs.sb.nodeSize)
+	copy(left, leaf)
+	for i := n - 1; i >= splitAt; i-- {
+		leafDeleteItem(left, i)
+	}
+	right := make([]byte, bfs.sb.nodeSize)
+	copy(right, leaf)
+	for i := splitAt - 1; i >= 0; i-- {
+		leafDeleteItem(right, i)
+	}
+
+	// First key of each child (for the interior key-ptrs).
+	leftKey := readKey(left[nodeHdrSize:])
+	rightKey := readKey(right[nodeHdrSize:])
+
+	gen := le.Uint64(leaf[0x50:]) // preserve current generation (surgical move)
+
+	// Allocate the LEFT leaf low, the RIGHT leaf at leafHighPhys (in the tail).
+	leftPhys, err := bfs.sm.allocNodeBlock()
+	if err != nil {
+		t.Fatalf("placeTreeMultiLevelHigh: alloc left leaf: %v", err)
+	}
+	leftLog := physToLog(bfs.sb, leftPhys)
+	le.PutUint64(left[0x30:], leftLog)
+	le.PutUint64(left[0x50:], gen)
+	updateNodeCRC(left)
+	if _, err := bfs.rwa.WriteAt(left, bfs.partOffset+int64(leftPhys)); err != nil {
+		t.Fatalf("placeTreeMultiLevelHigh: write left leaf: %v", err)
+	}
+
+	rightLog := physToLog(bfs.sb, leafHighPhys)
+	le.PutUint64(right[0x30:], rightLog)
+	le.PutUint64(right[0x50:], gen)
+	updateNodeCRC(right)
+	if _, err := bfs.rwa.WriteAt(right, bfs.partOffset+int64(leafHighPhys)); err != nil {
+		t.Fatalf("placeTreeMultiLevelHigh: write right leaf: %v", err)
+	}
+	bfs.sm.remove(leafHighPhys, uint64(bfs.sb.nodeSize))
+
+	// Build the level-1 interior node: header cloned from the leaf (fsid,
+	// chunk_tree_uuid, owner), level=1, nritems=2, two key-ptrs.
+	node := make([]byte, bfs.sb.nodeSize)
+	copy(node[:nodeHdrSize], leaf[:nodeHdrSize])
+	node[0x64] = 1 // level
+	le.PutUint32(node[0x60:], 2)
+	le.PutUint64(node[0x50:], gen)
+	writeKeyPtr := func(idx int, k key, blk, g uint64) {
+		off := nodeHdrSize + idx*keyPtrSize
+		le.PutUint64(node[off:], k.objID)
+		node[off+8] = k.typ
+		le.PutUint64(node[off+9:], k.offset)
+		le.PutUint64(node[off+17:], blk)
+		le.PutUint64(node[off+25:], g)
+	}
+	writeKeyPtr(0, leftKey, leftLog, gen)
+	writeKeyPtr(1, rightKey, rightLog, gen)
+	nodeLog := physToLog(bfs.sb, nodeHighPhys)
+	le.PutUint64(node[0x30:], nodeLog)
+	updateNodeCRC(node)
+	if _, err := bfs.rwa.WriteAt(node, bfs.partOffset+int64(nodeHighPhys)); err != nil {
+		t.Fatalf("placeTreeMultiLevelHigh: write interior node: %v", err)
+	}
+	bfs.sm.remove(nodeHighPhys, uint64(bfs.sb.nodeSize))
+
+	// Release the old single leaf's block; repoint the ROOT_ITEM at the interior
+	// node AND bump its recorded level to 1 (the kernel cross-checks
+	// ROOT_ITEM.level against the root node header level), then rebuild the extent
+	// tree in place.
+	//
+	// Skip the rebuild when the tree being made multi-level IS the extent tree:
+	// rebuildExtentTree rewrites the extent leaf in place at the extent root's
+	// bytenr as a LEVEL-0 leaf, which would flatten the interior node we just
+	// built. (The extent-tree-in-tail case is a refusal test, where exact
+	// post-build accounting is immaterial.)
+	bfs.sm.freeRange(oldPhys, uint64(bfs.sb.nodeSize))
+	if err := bfs.repointRootItemBytenrLocked(objID, nodeLog); err != nil {
+		t.Fatalf("placeTreeMultiLevelHigh: repoint ROOT_ITEM %d: %v", objID, err)
+	}
+	setRootItemLevel(t, bfs, objID, 1)
+	if objID != extentTreeObjID {
+		if err := rebuildExtentTree(bfs.rwa, bfs.partOffset, bfs.sb, bfs.sm); err != nil {
+			t.Fatalf("placeTreeMultiLevelHigh: rebuild extent tree: %v", err)
+		}
+	}
+	bfs.invalidateCache()
+	return nodeLog
+}
+
+// setRootItemLevel rewrites the `level` byte of the ROOT_ITEM (objID, ROOT_ITEM,
+// 0) in the root-tree leaf — a test-only surgical edit used when a fixture turns
+// a tree multi-level so the kernel's ROOT_ITEM.level ↔ root-node-level cross-check
+// passes. Caller holds bfs.mu.
+func setRootItemLevel(t *testing.T, bfs *btrfsFS, objID uint64, level byte) {
+	t.Helper()
+	phys, err := bfs.sb.physAddr(bfs.partOffset, bfs.sb.rootLogAddr)
+	if err != nil {
+		t.Fatalf("setRootItemLevel: physAddr: %v", err)
+	}
+	leaf := make([]byte, bfs.sb.nodeSize)
+	if _, err := bfs.rwa.ReadAt(leaf, phys); err != nil {
+		t.Fatalf("setRootItemLevel: read: %v", err)
+	}
+	idx := findItemIdx(leaf, objID, typeRootItem, 0)
+	if idx < 0 {
+		t.Fatalf("setRootItemLevel: ROOT_ITEM %d not found", objID)
+	}
+	items := parseLeafItems(leaf, parseNodeHeader(leaf).nItems)
+	d := items[idx].data(leaf)
+	if len(d) <= rootItemOffLevel {
+		t.Fatalf("setRootItemLevel: ROOT_ITEM %d too short", objID)
+	}
+	d[rootItemOffLevel] = level
+	updateNodeCRC(leaf)
+	if _, err := bfs.rwa.WriteAt(leaf, phys); err != nil {
+		t.Fatalf("setRootItemLevel: write: %v", err)
+	}
+	bfs.invalidateCache()
 }
 
 // reopenBtrfs closes fs and reopens the same path, returning the fresh handle.
@@ -397,6 +680,95 @@ func TestRelocMeta_DataAndMetadataInTail(t *testing.T) {
 	defer r2.Close()
 	if got, err := r2.ReadFile("/marker.bin"); err != nil || !bytes.Equal(got, marker) {
 		t.Errorf("relocated marker mismatch: err=%v len=%d", err, len(got))
+	}
+}
+
+// TestRelocMeta_MultiLevelInteriorInTail builds a genuine TWO-level DEV tree
+// whose interior root node AND one child leaf sit high in the [18,24) MiB tail,
+// then shrinks so the tail captures them. relocateTailMetadata must path-COW the
+// subtree down bottom-up (relocate the in-tail child leaf, repoint the interior
+// node's child key-ptr + generation, relocate the interior node, repoint the
+// ROOT_ITEM) — keeping the kernel's parent-transid invariant — and every file
+// must read back byte-identical. Runs on every CI arch (no kernel).
+func TestRelocMeta_MultiLevelInteriorInTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mlinterior.img")
+	fs, err := Format(path, 24*1024*1024, FormatConfig{Label: "mlint"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	bfs := fs.(*btrfsFS)
+	files := map[string][]byte{
+		"/a.txt": bytes.Repeat([]byte("AAAA"), 1500),
+		"/b.txt": []byte("hello multi-level\n"),
+	}
+	for name, data := range files {
+		if err := fs.WriteFile(name, data, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	// DEV tree has DEV_ITEM + DEV_EXTENT(s) in its single leaf — enough to split
+	// into a real two-level tree. Interior node at 21 MiB, right child leaf at
+	// 20 MiB; both inside the [18,24) MiB tail.
+	placeTreeMultiLevelHigh(t, bfs, devTreeObjID, 21*1024*1024, 20*1024*1024)
+
+	if err := bfs.Shrink(18 * 1024 * 1024); err != nil {
+		t.Fatalf("Shrink with multi-level interior node in tail: %v", err)
+	}
+	if got := readSBTotalBytes(t, bfs); got != 18*1024*1024 {
+		t.Errorf("post-shrink total_bytes = %d, want %d", got, 18*1024*1024)
+	}
+	assertNoMetaAboveLocked(t, bfs, 18*1024*1024)
+
+	r2 := reopenBtrfs(t, bfs, path)
+	defer r2.Close()
+	for name, data := range files {
+		if got, err := r2.ReadFile(name); err != nil || !bytes.Equal(got, data) {
+			t.Errorf("after shrink %s mismatch: err=%v len=%d want %d", name, err, len(got), len(data))
+		}
+	}
+}
+
+// TestRemoveChunk_NonEmptyRelocates builds a 2-data-chunk image whose trailing
+// chunk holds a real live file, then Shrink-drops that whole chunk: its contents
+// must be relocated into the lower chunk and the now-empty chunk removed. The
+// relocated file must survive byte-identical and the device must shrink to the
+// chunk boundary. Runs on every arch (no kernel).
+func TestRemoveChunk_NonEmptyRelocates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nonempty-chunk.img")
+	fs, err := Format(path, 16*1024*1024, FormatConfig{Label: "nechunk"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	bfs := fs.(*btrfsFS)
+	if err := fs.WriteFile("/keep.bin", metaFixtureKeep, 0o644); err != nil {
+		t.Fatalf("keep: %v", err)
+	}
+	payload := bytes.Repeat([]byte("RELOC-ME-ALIGNED-"), 256*8)
+	newChunkLog := appendDataChunkWithLiveExtent(t, bfs, 8*1024*1024, "/tail.bin", payload)
+
+	if err := bfs.Shrink(int64(newChunkLog)); err != nil {
+		t.Fatalf("Shrink dropping non-empty trailing chunk: %v", err)
+	}
+	if got := readSBTotalBytes(t, bfs); got != newChunkLog {
+		t.Errorf("post-shrink total_bytes = %d, want %d", got, newChunkLog)
+	}
+	// No local chunk may extend past the shrunk device.
+	bfs.mu.Lock()
+	for _, m := range bfs.sb.sysChunks {
+		if m.localStripeIdx >= 0 && m.physStart+m.size > newChunkLog {
+			t.Errorf("chunk at phys 0x%X size %d extends past shrunk size %d", m.physStart, m.size, newChunkLog)
+		}
+	}
+	bfs.mu.Unlock()
+	assertNoMetaAboveLocked(t, bfs, newChunkLog)
+
+	r2 := reopenBtrfs(t, bfs, path)
+	defer r2.Close()
+	if got, err := r2.ReadFile("/keep.bin"); err != nil || !bytes.Equal(got, metaFixtureKeep) {
+		t.Errorf("/keep.bin mismatch after chunk reloc: err=%v len=%d", err, len(got))
+	}
+	if got, err := r2.ReadFile("/tail.bin"); err != nil || !bytes.Equal(got, payload) {
+		t.Errorf("relocated /tail.bin mismatch: err=%v len=%d", err, len(got))
 	}
 }
 

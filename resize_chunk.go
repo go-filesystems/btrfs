@@ -5,17 +5,19 @@ package filesystem_btrfs
 // When a shrink drops the device below the start of the trailing chunk, that
 // chunk must be removed wholesale — its BLOCK_GROUP_ITEM, CHUNK_ITEM, DEV_EXTENT
 // and (when present) sys_chunk_array entry deleted and the dev-tree / chunk-tree
-// kept consistent — mirroring the kernel's btrfs_remove_chunk path. This is only
-// sound when the chunk is EMPTY (its block group's `used` is 0) and there is a
-// lower chunk that still anchors the device tail after removal; otherwise live
-// data/metadata would be discarded with no place to evacuate it.
+// kept consistent — mirroring the kernel's btrfs_remove_chunk path. A lower
+// chunk must still anchor the device tail after removal.
 //
-// The images this single-device writer produces always carry exactly one
-// DATA|METADATA chunk that also holds every metadata block, so a real
-// whole-chunk removal only arises for images that grew a second, pure-DATA
-// chunk (or were authored externally). Removing the only chunk, the bootstrap
-// SYSTEM chunk, or a non-empty trailing chunk (which would need cross-chunk
-// content relocation) stays a precise refusal — see Shrink.
+// When the trailing chunk is EMPTY the items are deleted directly. When it is
+// NON-empty, its live data extents and metadata blocks are first COW-relocated
+// into the lower anchoring chunk's free space (relocateNonEmptyChunkLocked — the
+// kernel's relocate_block_group / `btrfs balance` path), the transaction is
+// finalized so the block-group `used` moves to the lower chunk, and the now-empty
+// chunk is then removed.
+//
+// Removing the only chunk or the bootstrap SYSTEM chunk, or a non-empty chunk
+// whose live footprint does not fit below the new size, stays a precise refusal
+// — see Shrink / removeWholeTrailingChunkLocked.
 
 import (
 	"encoding/binary"
@@ -24,7 +26,9 @@ import (
 
 // removeWholeTrailingChunkLocked validates that the trailing chunk at
 // sysChunks[idx] can be removed wholesale by a shrink to newSize, then performs
-// the removal. The preconditions (each a precise refusal otherwise):
+// the removal — relocating its live contents into the lower anchoring chunk
+// first when the chunk is non-empty. The preconditions (each a precise refusal,
+// image untouched):
 //
 //   - newSize must equal the chunk's physical start: the device tail lands
 //     exactly at the chunk boundary, not part-way into it (a partial drop of a
@@ -32,10 +36,13 @@ import (
 //   - a lower LOCAL chunk must end exactly at newSize, so the device stays
 //     gap-free and anchored after the removal (never remove the only/bootstrap
 //     chunk and leave the device with no chunk reaching its tail).
-//   - the chunk must be empty (evacuable): no live data extent or metadata block
-//     inside it and a zero block-group `used`. A non-empty chunk would need its
-//     contents relocated into a lower chunk first (cross-chunk relocation), which
-//     this writer does not implement.
+//
+// When the chunk is empty it is deleted directly (btrfs_remove_chunk for an
+// empty block group). When it is non-empty, its live data extents and metadata
+// blocks are first COW-relocated into the lower chunk's free space (the kernel's
+// relocate_block_group / btrfs balance path) via relocateNonEmptyChunkLocked,
+// then the now-empty chunk is removed. A non-empty chunk whose live footprint
+// does not fit below newSize is refused (image untouched).
 //
 // Caller holds fs.mu.
 func (fs *btrfsFS) removeWholeTrailingChunkLocked(idx int, newSize uint64) error {
@@ -60,9 +67,68 @@ func (fs *btrfsFS) removeWholeTrailingChunkLocked(idx int, newSize uint64) error
 			chunk.physStart, newSize)
 	}
 	if !fs.chunkIsEvacuableLocked(idx) {
-		return fmt.Errorf("trailing chunk at phys 0x%X is not empty (non-empty whole-chunk relocation not supported)", chunk.physStart)
+		// Non-empty: relocate the chunk's live contents into the lower chunk,
+		// then fall through to the empty-chunk removal. relocateNonEmptyChunkLocked
+		// leaves the image consistent (rolls the evicted tail back) on failure.
+		if err := fs.relocateNonEmptyChunkLocked(idx, newSize); err != nil {
+			return err
+		}
 	}
 	return fs.removeTrailingChunkLocked(idx, newSize)
+}
+
+// relocateNonEmptyChunkLocked evacuates the live contents of the non-empty
+// trailing chunk at sysChunks[idx] into free space in the lower (anchoring)
+// chunk, leaving the trailing chunk empty so removeTrailingChunkLocked can drop
+// it. It reuses the shrink-relocation machinery with the relocation window set
+// to the WHOLE chunk: data extents are COW-copied below the chunk start and
+// every referencing item / backref is rewritten; non-FS metadata blocks are
+// path-COW-relocated; the FS_TREE reseats via COW. The transaction is then
+// finalized (updateFsTreeRoot → rebuildExtentTree) BEFORE the chunk is removed,
+// so the rebuilt block-group `used` moves from this chunk (→ 0) to the lower one
+// and the intermediate image is itself btrfs-check-clean.
+//
+// On entry the chunk's logical range is still in the space manager's free map as
+// far as future allocations are concerned; we evict it first so every
+// replacement lands strictly below newSize (== the chunk start), i.e. in the
+// lower chunk. Any allocation that cannot fit there surfaces as an error and the
+// evicted range is restored. Caller holds fs.mu.
+func (fs *btrfsFS) relocateNonEmptyChunkLocked(idx int, newSize uint64) error {
+	chunk := fs.sb.sysChunks[idx]
+	dropStart := chunk.physStart
+	dropEnd := chunk.physStart + chunk.size
+
+	// Evict the chunk's range so replacement allocations never land back in it.
+	fs.sm.remove(dropStart, dropEnd-dropStart)
+
+	if err := fs.relocateTailExtents(dropStart, dropEnd); err != nil {
+		fs.sm.freeRange(dropStart, dropEnd-dropStart)
+		return fmt.Errorf("relocate non-empty chunk at phys 0x%X: %w", chunk.physStart, err)
+	}
+
+	// Post-condition oracle: no live data extent and no live metadata block may
+	// overlap the chunk after relocation.
+	if leftover := fs.collectRelocTargets(dropStart, dropEnd); len(leftover) > 0 {
+		fs.sm.freeRange(dropStart, dropEnd-dropStart)
+		return fmt.Errorf("relocate non-empty chunk at phys 0x%X: %d live data extent(s) remain after relocation",
+			chunk.physStart, len(leftover))
+	}
+
+	// Finalize the relocation transaction while the (now-empty) chunk is STILL in
+	// sb.sysChunks, so rebuildExtentTree recomputes this chunk's block-group
+	// `used` to 0 and grows the lower chunk's `used` by the relocated bytes. The
+	// chunk's own BLOCK_GROUP_ITEM is deleted afterwards by removeTrailingChunkLocked.
+	if err := updateFsTreeRoot(fs.rwa, fs.partOffset, fs.sb, fs.sm, fs.fsTreeRoot); err != nil {
+		return fmt.Errorf("relocate non-empty chunk at phys 0x%X: finalize: %w", chunk.physStart, err)
+	}
+	fs.invalidateCache()
+
+	// Sanity: the chunk must now report a zero block-group `used`.
+	if used, ok := fs.blockGroupUsedLocked(chunk.logStart, chunk.size); ok && used != 0 {
+		return fmt.Errorf("relocate non-empty chunk at phys 0x%X: block group still reports used=%d after relocation",
+			chunk.physStart, used)
+	}
+	return nil
 }
 
 // removeTrailingChunkLocked deletes the empty trailing chunk at sysChunks[idx]
@@ -139,18 +205,13 @@ func (fs *btrfsFS) deleteDevTreeItemLocked(objID uint64, typ uint8, off uint64) 
 	if err != nil {
 		return nil // no dev tree — nothing to maintain
 	}
-	phys, err := fs.sb.physAddr(fs.partOffset, devRoot)
+	// Descend interior nodes if the dev tree is multi-level (e.g. after a
+	// multi-level relocation), locating the leaf that holds the item.
+	leaf, phys, err := fs.findExtentLeafWithKey(devRoot, objID, typ, off)
 	if err != nil {
-		return nil
+		return fmt.Errorf("locate dev tree item: %w", err)
 	}
-	leaf := make([]byte, fs.sb.nodeSize)
-	if _, err := fs.rwa.ReadAt(leaf, phys); err != nil {
-		return fmt.Errorf("read dev tree node: %w", err)
-	}
-	if parseNodeHeader(leaf).level != 0 {
-		return nil // multi-level dev tree out of scope
-	}
-	if findItemIdx(leaf, objID, typ, off) < 0 {
+	if leaf == nil {
 		return nil // tolerate absence
 	}
 	return fs.deleteLeafItemInPlace(phys, objID, typ, off)

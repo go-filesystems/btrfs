@@ -188,11 +188,14 @@ func (fs *btrfsFS) Shrink(newSizeBytes int64) error {
 	}
 	tail := fs.sb.sysChunks[tailIdx]
 	if uint64(newSizeBytes) <= tail.physStart {
-		// The shrink drops the entire trailing chunk. Remove it wholesale when it
-		// is empty and a lower local chunk anchors the new device tail (mirrors
-		// `btrfs balance -dusage=0` + `btrfs filesystem resize`). Anything else —
-		// a partial drop into the chunk below, the only/bootstrap chunk, or a
-		// non-empty chunk needing cross-chunk content relocation — is refused.
+		// The shrink drops the entire trailing chunk. Remove it wholesale: when it
+		// is empty the chunk items are deleted directly; when it is NON-empty its
+		// live contents are first relocated into the lower anchoring chunk
+		// (cross-chunk relocation, the kernel's `btrfs balance` path) and the now-
+		// empty chunk is then dropped. A lower local chunk must anchor the new
+		// device tail (mirrors `btrfs filesystem resize`); a partial drop into the
+		// chunk below, the only/bootstrap chunk, or a non-empty chunk whose
+		// footprint does not fit below the new size — is refused.
 		if err := fs.removeWholeTrailingChunkLocked(tailIdx, uint64(newSizeBytes)); err != nil {
 			return fmt.Errorf("btrfs shrink: %w", err)
 		}
@@ -375,22 +378,19 @@ func (fs *btrfsFS) rewriteDevExtentLengthLocked(logStart, newLen uint64) error {
 	if err != nil {
 		return nil // no dev tree (synthetic fixture) — nothing to maintain
 	}
-	phys, err := fs.sb.physAddr(fs.partOffset, devRoot)
+	// Locate the leaf holding the DEV_EXTENT, descending interior nodes if the
+	// dev tree is multi-level (e.g. after a multi-level relocation). The leaf is
+	// edited in place at its own bytenr — transid stays valid.
+	leafBuf, phys, err := fs.findExtentLeafWithKey(devRoot, 1, typeDevExtent, logStart)
 	if err != nil {
-		return nil
+		return fmt.Errorf("locate DEV_EXTENT leaf: %w", err)
 	}
-	leafBuf := make([]byte, fs.sb.nodeSize)
-	if _, err := fs.rwa.ReadAt(leafBuf, phys); err != nil {
-		return fmt.Errorf("read dev tree node: %w", err)
-	}
-	if parseNodeHeader(leafBuf).level != 0 {
-		// Multi-level dev tree (very large fs): out of scope for the in-place
-		// edit; leave it. Resize of such images is not supported here.
-		return nil
+	if leafBuf == nil {
+		return nil // no matching dev extent — tolerate
 	}
 	idx := findItemIdx(leafBuf, 1, typeDevExtent, logStart)
 	if idx < 0 {
-		return nil // no matching dev extent — tolerate
+		return nil
 	}
 	items := parseLeafItems(leafBuf, parseNodeHeader(leafBuf).nItems)
 	d := items[idx].data(leafBuf)
@@ -659,14 +659,26 @@ func (sm *spaceManager) rangeFree(start, size uint64) bool {
 //     below the new size by relocateTailMetadata (resize_reloc.go); the
 //     EXTENT_TREE is then rebuilt to account them. btrfs-check / kernel-mount
 //     validated (TestRelocMeta_KernelOracle).
-//   - A shrink that removes an entire EMPTY trailing chunk deletes its
-//     CHUNK_ITEM / DEV_EXTENT / BLOCK_GROUP_ITEM / sys_chunk_array entry
-//     (resize_chunk.go), mirroring btrfs_remove_chunk; validated by
+//   - A multi-level non-FS tree (an interior root node, or interior/leaf
+//     descendants) sitting in the tail is path-COW-relocated bottom-up by
+//     relocateSubtreePath (resize_reloc.go): the deepest tail node moves first,
+//     parents' child key-pointers (blockptr + generation) are repointed, and the
+//     gen bump propagates up the whole path to the ROOT_ITEM — keeping the
+//     kernel's parent-transid invariant. btrfs-check / kernel-mount validated.
+//   - A shrink that removes an entire trailing chunk deletes its CHUNK_ITEM /
+//     DEV_EXTENT / BLOCK_GROUP_ITEM / sys_chunk_array entry (resize_chunk.go),
+//     mirroring btrfs_remove_chunk. When the chunk is NON-empty its live data
+//     extents and metadata blocks are first relocated into the lower anchoring
+//     chunk (relocateNonEmptyChunkLocked, the kernel's relocate_block_group
+//     path) and the transaction finalized before removal. Validated by
 //     TestRemoveChunk_KernelOracle.
 //
-// Out of scope (refused with a clear error, image left untouched):
+// Out of scope (refused with a clear error, image left untouched/consistent):
 //
-//   - A tail block this writer cannot relocate: a multi-level interior tree
-//     node (only single-leaf tree roots are moved).
-//   - A non-empty whole-chunk drop, which would need the chunk's live contents
-//     relocated into a lower chunk first (cross-chunk content relocation).
+//   - A MULTI-LEVEL ROOT_TREE whose ROOT_ITEM leaf would move (the in-place
+//     ROOT_ITEM edit cannot descend a multi-level root tree), and the
+//     EXTENT_TREE's own nodes when the extent tree is multi-level (the extent
+//     leaf is rebuilt in place under a single-leaf assumption). The chunk tree
+//     (SYSTEM chunk, never in the DATA tail) is never relocated.
+//   - A non-empty whole-chunk drop whose live footprint does not fit in the
+//     lower chunk's free space below the new size.

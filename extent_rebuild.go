@@ -37,10 +37,13 @@ func extentTreeRoot(rwaAt readerWriterAt, partOff int64, sb *superblock) (uint64
 	return binary.LittleEndian.Uint64(d[rootItemOffBytenr:]), nil
 }
 
-// metaBlock is one live tree block: its logical address and owning tree.
+// metaBlock is one live tree block: its logical address, owning tree, and node
+// level (0 for a leaf). The level is the skinny METADATA_ITEM key offset, which
+// the kernel cross-checks against the block's node-header level.
 type metaBlock struct {
 	logAddr uint64
 	owner   uint64
+	level   uint8
 }
 
 // dataExtent is one live regular (non-inline) file data extent.
@@ -73,7 +76,13 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 		_ = walkNodeAddrs(rwaAt, partOff, sb, root, func(logAddr uint64) error {
 			if !seen[logAddr] {
 				seen[logAddr] = true
-				blocks = append(blocks, metaBlock{logAddr, owner})
+				// Read the node header to record its level (skinny METADATA_ITEM
+				// key offset = level). A read failure leaves it level 0.
+				var lvl uint8
+				if nb, rerr := readNode(rwaAt, partOff, sb, logAddr); rerr == nil {
+					lvl = parseNodeHeader(nb).level
+				}
+				blocks = append(blocks, metaBlock{logAddr, owner, lvl})
 			}
 			return nil
 		})
@@ -142,7 +151,7 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 	le := binary.LittleEndian
 	var recs []itemRec
 	for _, b := range blocks {
-		recs = append(recs, itemRec{key{b.logAddr, typeMetadataItem, 0}, buildMetadataItemBytes(le, b.owner)})
+		recs = append(recs, itemRec{key{b.logAddr, typeMetadataItem, uint64(b.level)}, buildMetadataItemBytes(le, b.owner)})
 	}
 	for _, de := range dataExtents {
 		recs = append(recs, itemRec{key{de.logAddr, typeExtentItem, de.length}, buildDataExtentItemBytes(le, de.owner, de.objectid, de.fileOffset)})

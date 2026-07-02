@@ -139,11 +139,17 @@ func (fs *btrfsFS) Grow(newSizeBytes int64) error {
 }
 
 // Shrink reduces the filesystem to newSizeBytes. The new size must be
-// strictly smaller than the current size (equal is a no-op), and the
-// [newSize, oldSize) physical region must be entirely free — Shrink
-// does not yet relocate extents (see TODO at end of file). Returns
-// an error wrapping a "shrink would discard live data" message when
-// the trailing region is not empty.
+// strictly smaller than the current size (equal is a no-op). When the
+// [newSize, oldSize) physical tail is inhabited, Shrink COW-relocates the
+// live DATA extents and the non-FS_TREE metadata blocks out of it into free
+// space below the new size (see resize_reloc.go); a whole-chunk drop first
+// relocates the chunk's live contents into the lower anchoring chunk (see
+// resize_chunk.go). It refuses (image left untouched) only on the residual
+// cases the write path cannot handle: a multi-level ROOT_TREE ROOT_ITEM edit,
+// the EXTENT_TREE's own nodes when that tree is multi-level, and a non-empty
+// whole-chunk drop whose footprint does not fit below the new size (see the
+// scope block at the end of this file). Returns an error wrapping a "live data
+// extent(s) remain" message when relocation cannot fully evacuate the tail.
 func (fs *btrfsFS) Shrink(newSizeBytes int64) error {
 	if newSizeBytes < 0 {
 		return fmt.Errorf("btrfs shrink: negative size %d", newSizeBytes)
@@ -180,8 +186,9 @@ func (fs *btrfsFS) Shrink(newSizeBytes int64) error {
 	}
 
 	// The shrink window [newSize, cur) must lie entirely within ONE chunk
-	// (the tail chunk) AND that range must be fully free in the space
-	// manager. Relocation of live extents is not implemented.
+	// (the tail chunk). If the range is already free it is truncated directly;
+	// if it is inhabited the live extents/metadata are COW-relocated below the
+	// new size (see the non-empty branch below and resize_reloc.go).
 	tailIdx, err := fs.tailChunkIdxLocked(uint64(cur))
 	if err != nil {
 		return fmt.Errorf("btrfs shrink: %w", err)

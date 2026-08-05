@@ -18,17 +18,25 @@ https://btrfs.readthedocs.io/en/latest/
 
 | Feature | Status | Notes |
 |---|---:|---|
-| Open / Close | ✅ | Single-device images supported |
-| Format | ✅ | Creates a new Btrfs image |
-| ReadFile | ✅ | Full file reads supported |
-| WriteFile | ✅ | Full file writes supported |
+| Open / Close | ✅ | Single-device images; `OpenFromDevice`/`OpenFromDevices` for layered/multi-device backends |
+| Format | ✅ | Creates a new single-device Btrfs image |
+| ReadFile / WriteFile | ✅ | Full file I/O supported |
 | MkDir / Delete / Rename | ✅ | Directory and rename operations supported |
-| ReadLink / Symlinks | ✅ | Supported |
+| ReadLink / Symlinks | ✅ | Read + create (`FS.Symlink`) |
+| Hardlinks | ✅ | `FS.Link` |
+| Xattrs | ✅ | `Xattrs` / `GetXattr` / `SetXattr` / `RemoveXattr` |
+| Extended metadata | ✅ | `ExtendedStat` (uid/gid, timestamps, nlink, nbytes, transid/sequence, flags); `Chown` / `Chmod` / `Chtimes` / `Truncate` |
+| Volume label | ✅ | `Label` / `SetLabel` |
+| Subvolumes / snapshots | ✅ read-only | `Subvolumes` enumerates ROOT_TREE entries; `OpenSubvolumeByID`/`OpenSubvolumeByName` open one read-only. Creating a subvolume or snapshot is not supported (needs ref-counted extent backrefs) |
+| Multi-device / RAID (RAID0/1/10/5/6/DUP) | ✅ read-only | Decoded via `OpenFromDevices`; writes are single-device only |
+| Grow / Shrink / Resize | ✅ | `Shrink` refuses to discard live data; requires an idle filesystem (no concurrent writers during resize) |
 | Partitioned images | ✅ | MBR/GPT auto-detected |
 
 ## Limitations
 
-- Advanced Btrfs features such as snapshots, send/receive, multi-device/RAID management, quotas and reflink are not fully implemented.
+- Subvolume/snapshot *creation* and send/receive are not implemented (read-only support exists — see above).
+- Quotas and reflink are not implemented.
+- Multi-device/RAID *writes* are not implemented (reading multi-device pools is).
 - No online device add/remove or balance operations.
 - Intended for testing and tooling; not recommended for production use.
 
@@ -50,49 +58,67 @@ https://btrfs.readthedocs.io/en/latest/
 
 ## API
 
-### Format
+`FS` is an interface (not a struct) — `Open`/`OpenFromDevice`/`OpenFromDevices`
+return `FS`; `Format` returns the narrower `filesystem.Filesystem`. Every
+method below is called through the interface value (`fs.Symlink(...)`, not
+`(*FS).Symlink`).
+
+### Format / Open
 
 ```go
 type FormatConfig struct {
     UUID  [16]byte // zero = randomly generated
-    Label string
+    Label string    // up to 255 bytes, NUL-padded on disk
 }
 
-func Format(path string, sizeBytes int64, cfg FormatConfig) (*FS, error)
+func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesystem, error)
+func Open(imagePath string, partIndex int) (FS, error)
+func OpenFromDevice(dev BlockBackend, partIndex int) (FS, error)
+func OpenFromDevices(devs []BlockBackend, partIndex int) (FS, error) // multi-device RAID, read-only
 ```
 
-### Open
+### FS interface
 
 ```go
-func Open(imagePath string, partIndex int) (*FS, error)
-func (fs *FS) Close() error
-```
+type FS interface {
+    filesystem.Filesystem // Close, ReadFile, ListDir, Stat, WriteFile, ReadLink,
+                           // MkDir, DeleteFile, DeleteDir, Rename
 
-### Read
+    Link(oldPath, newPath string) error
+    Symlink(target, linkPath string) error
 
-```go
-func (fs *FS) Stat(path string) (filesystem.Stat, error)
-func (fs *FS) ListDir(path string) ([]filesystem.DirEntry, error)
-func (fs *FS) ReadFile(path string) ([]byte, error)
-func (fs *FS) ReadLink(path string) (string, error)
-```
+    Xattrs(path string) (map[string][]byte, error)
+    GetXattr(path, name string) ([]byte, error)
+    SetXattr(path, name string, value []byte) error
+    RemoveXattr(path, name string) error
 
-### Write
+    ExtendedStat(path string) (*InodeStat, error)
+    Chown(path string, uid, gid uint32) error
+    Chmod(path string, perm os.FileMode) error
+    Chtimes(path string, atime, mtime time.Time) error
+    Truncate(path string, newSize int64) error
 
-```go
-func (fs *FS) WriteFile(path string, data []byte, perm os.FileMode) error
-func (fs *FS) MkDir(path string, perm os.FileMode) error
-func (fs *FS) DeleteFile(path string) error
-func (fs *FS) DeleteDir(path string) error
-func (fs *FS) Rename(oldPath, newPath string) error
+    Label() string
+    SetLabel(label string) error
+
+    // Subvolume / snapshot read support (creation is not supported).
+    Subvolumes() ([]Subvolume, error)
+    OpenSubvolumeByID(id uint64) (filesystem.Filesystem, error)
+    OpenSubvolumeByName(name string) (filesystem.Filesystem, error)
+
+    // Filesystem-level resize. Requires an idle FS (no concurrent writers).
+    Grow(newSizeBytes int64) error
+    Shrink(newSizeBytes int64) error
+    Resize(newSizeBytes int64) error
+}
 ```
 
 ## Integration test
 
-Set `integrationImagePath` in `btrfs_test.go` and run:
+Set `integrationImagePath` in `btrfs_test.go` and run (from the repo root):
 
-```
-go test -v -run TestOpen_Integration ./pkg/filesystem-btrfs
+```bash
+go test -v -run TestOpen_Integration .
 ```
 
 ## Implements

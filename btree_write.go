@@ -754,7 +754,7 @@ func splitAndInsertInternal(nodeBuf []byte, insertIdx int, k key, childLog uint6
 		childLog uint64
 		gen      uint64
 	}
-	all := make([]kp, 0, n+1)
+	all := make([]kp, 0, itemsThatFit(nodeBuf, hdr.nItems, keyPtrSize)+1)
 	for i := 0; i < n; i++ {
 		off := nodeHdrSize + i*keyPtrSize
 		all = append(all, kp{

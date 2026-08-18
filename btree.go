@@ -74,8 +74,25 @@ type leafItem struct {
 	dataSize uint32
 }
 
+// itemsThatFit is how many fixed-size records a node buffer can physically
+// hold. nritems in the node header is attacker-controlled, and it was being
+// passed straight to make() as a capacity hint: a SINGLE corrupted byte made
+// parseLeafItems reserve 4.29e9 items -- 237 GB measured -- for a 16 KiB node,
+// killing the process before any of the bounds checks below could run. The
+// buffer is the only bound on the count that does not itself come off the disk.
+func itemsThatFit(buf []byte, n uint32, stride int) int {
+	fit := (len(buf) - nodeHdrSize) / stride
+	if fit < 0 {
+		return 0
+	}
+	if int64(n) > int64(fit) {
+		return fit
+	}
+	return int(n)
+}
+
 func parseLeafItems(buf []byte, n uint32) []leafItem {
-	items := make([]leafItem, 0, n)
+	items := make([]leafItem, 0, itemsThatFit(buf, n, itemSize))
 	le := binary.LittleEndian
 	for i := uint32(0); i < n; i++ {
 		off := nodeHdrSize + int(i)*itemSize

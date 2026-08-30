@@ -65,6 +65,20 @@ jobs:
         working-directory: btrfs
         env:
           CGO_ENABLED: "1"
+          # TestStress_ManyFiles is quadratic in the file count, and -race costs
+          # another ~9x on top. At the built-in non-short size of 5000 the job
+          # sat within a minute of the 30m wall for weeks -- the 2026-08-18 run
+          # passed at 30m19s -- and on 2026-08-30 it crossed, on a commit that
+          # touched only the Renovate preset. Measured here, same machine:
+          #
+          #     n=2000  no race   6.3s     -race   56s
+          #     n=2500            ~10s     -race   82s
+          #     n=5000            36s      -race  324s
+          #
+          # 2000 keeps a real many-files stress and leaves the lane a wide
+          # margin. The quadratic growth itself is issue #12; raising this back
+          # up is what that issue has to earn.
+          BTRFS_STRESS_FILES: "2000"
         run: go test -race -count=1 -covermode=atomic -coverprofile=cover.out -timeout=30m ./...
 
       - name: Gate coverage

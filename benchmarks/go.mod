@@ -6,8 +6,8 @@ module github.com/go-filesystems/btrfs/benchmarks
 go 1.26.4
 
 require (
-	github.com/go-filesystems/btrfs v0.0.0
-	github.com/go-filesystems/interface v0.0.0-20260622072638-0b01d4fb163f
+	github.com/go-filesystems/btrfs v0.1.0
+	github.com/go-filesystems/interface v0.2.0
 )
 
 require (

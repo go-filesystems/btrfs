@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/go-filesystems/interface v0.3.0
-	github.com/klauspost/compress v1.19.2
+	github.com/klauspost/compress v1.20.0
 )
 
 require (

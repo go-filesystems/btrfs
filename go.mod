@@ -9,6 +9,6 @@ require (
 
 require (
 	github.com/anchore/go-lzo v0.1.1
-	github.com/go-volumes/gpt v0.0.0-20260831115417-b3069a3ac03a
+	github.com/go-volumes/gpt v0.2.0
 	github.com/go-volumes/safeio v0.0.0-20260831125406-d8f54b2890d4
 )

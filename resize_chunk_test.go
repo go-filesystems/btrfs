@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -321,19 +319,9 @@ func TestRemoveChunk_RefusesNonEmpty(t *testing.T) {
 // TestRemoveChunk_KernelOracle is the real kernel oracle for whole-chunk
 // removal: build a 2-data-chunk image, remove the empty trailing chunk, then
 // `btrfs check` and loop-mount, asserting a clean check and byte-identical
-// files. Root + btrfs-progs gated.
+// files. The check half needs btrfs-progs only; the mount half needs root.
 func TestRemoveChunk_KernelOracle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("kernel oracle is slow / needs root+tools; skipped in -short")
-	}
-	if os.Geteuid() != 0 {
-		t.Skip("kernel oracle needs root for losetup/mount")
-	}
-	for _, bin := range []string{"btrfs", "mount", "umount", "losetup"} {
-		if _, err := exec.LookPath(bin); err != nil {
-			t.Skipf("%s not on PATH; skipping kernel oracle", bin)
-		}
-	}
+	requireBtrfsCheck(t)
 
 	dir := t.TempDir()
 	img := filepath.Join(dir, "oracle.img")
@@ -359,85 +347,7 @@ func TestRemoveChunk_KernelOracle(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	out, err := exec.Command("btrfs", "check", img).CombinedOutput()
-	if err != nil {
-		t.Fatalf("btrfs check failed: %v\n%s", err, out)
-	}
-	if bytes.Contains(out, []byte("ERROR")) || bytes.Contains(out, []byte("error(s) found")) {
-		t.Fatalf("btrfs check reported errors:\n%s", out)
-	}
-
-	loopOut, err := exec.Command("losetup", "--find", "--show", img).CombinedOutput()
-	if err != nil {
-		t.Fatalf("losetup: %v\n%s", err, loopOut)
-	}
-	loop := strings.TrimSpace(string(loopOut))
-	defer exec.Command("losetup", "-d", loop).Run()
-	mnt := filepath.Join(dir, "mnt")
-	if err := os.MkdirAll(mnt, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if mout, err := exec.Command("mount", "-o", "ro", loop, mnt).CombinedOutput(); err != nil {
-		t.Fatalf("mount: %v\n%s", err, mout)
-	}
-	defer exec.Command("umount", mnt).Run()
-
-	for name, data := range files {
-		got, err := os.ReadFile(filepath.Join(mnt, strings.TrimPrefix(name, "/")))
-		if err != nil || !bytes.Equal(got, data) {
-			t.Fatalf("kernel-mounted %s mismatch: err=%v len=%d want %d", name, err, len(got), len(data))
-		}
-	}
-}
-
-// requireKernelOracle skips unless the test may run the real kernel oracle
-// (non-short, root, btrfs-progs present).
-func requireKernelOracle(t *testing.T) {
-	t.Helper()
-	if testing.Short() {
-		t.Skip("kernel oracle is slow / needs root+tools; skipped in -short")
-	}
-	if os.Geteuid() != 0 {
-		t.Skip("kernel oracle needs root for losetup/mount")
-	}
-	for _, bin := range []string{"btrfs", "mount", "umount", "losetup"} {
-		if _, err := exec.LookPath(bin); err != nil {
-			t.Skipf("%s not on PATH; skipping kernel oracle", bin)
-		}
-	}
-}
-
-// kernelCheckAndMount runs `btrfs check` on img (asserting clean) then loop-mounts
-// it read-only and verifies every file in want is byte-identical.
-func kernelCheckAndMount(t *testing.T, dir, img string, want map[string][]byte) {
-	t.Helper()
-	out, err := exec.Command("btrfs", "check", img).CombinedOutput()
-	if err != nil {
-		t.Fatalf("btrfs check failed: %v\n%s", err, out)
-	}
-	if bytes.Contains(out, []byte("ERROR")) || bytes.Contains(out, []byte("error(s) found")) {
-		t.Fatalf("btrfs check reported errors:\n%s", out)
-	}
-	loopOut, err := exec.Command("losetup", "--find", "--show", img).CombinedOutput()
-	if err != nil {
-		t.Fatalf("losetup: %v\n%s", err, loopOut)
-	}
-	loop := strings.TrimSpace(string(loopOut))
-	defer exec.Command("losetup", "-d", loop).Run()
-	mnt := filepath.Join(dir, "mnt")
-	if err := os.MkdirAll(mnt, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if mout, err := exec.Command("mount", "-o", "ro", loop, mnt).CombinedOutput(); err != nil {
-		t.Fatalf("mount: %v\n%s", err, mout)
-	}
-	defer exec.Command("umount", mnt).Run()
-	for name, data := range want {
-		got, err := os.ReadFile(filepath.Join(mnt, strings.TrimPrefix(name, "/")))
-		if err != nil || !bytes.Equal(got, data) {
-			t.Fatalf("kernel-mounted %s mismatch: err=%v len=%d want %d", name, err, len(got), len(data))
-		}
-	}
+	checkThenMount(t, dir, img, files)
 }
 
 // TestRemoveChunk_NonEmptyKernelOracle is the real kernel oracle for NON-empty
@@ -446,7 +356,7 @@ func kernelCheckAndMount(t *testing.T, dir, img string, want map[string][]byte) 
 // lower chunk and the chunk be removed — then `btrfs check` must be clean and the
 // kernel must mount it with every file byte-identical. Root + btrfs-progs gated.
 func TestRemoveChunk_NonEmptyKernelOracle(t *testing.T) {
-	requireKernelOracle(t)
+	requireBtrfsCheck(t)
 	dir := t.TempDir()
 	img := filepath.Join(dir, "ne-oracle.img")
 	fs, err := Format(img, 16*1024*1024, FormatConfig{Label: "neoracle"})
@@ -468,7 +378,7 @@ func TestRemoveChunk_NonEmptyKernelOracle(t *testing.T) {
 	if err := fs.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	kernelCheckAndMount(t, dir, img, files)
+	checkThenMount(t, dir, img, files)
 }
 
 // TestRelocMeta_MultiLevelKernelOracle is the real kernel oracle for multi-level
@@ -476,7 +386,7 @@ func TestRemoveChunk_NonEmptyKernelOracle(t *testing.T) {
 // node and one child leaf in the removed tail is shrunk, then `btrfs check` must
 // be clean and the kernel must mount it with every file intact. Gated.
 func TestRelocMeta_MultiLevelKernelOracle(t *testing.T) {
-	requireKernelOracle(t)
+	requireBtrfsCheck(t)
 	dir := t.TempDir()
 	img := filepath.Join(dir, "ml-oracle.img")
 	fs, err := Format(img, 24*1024*1024, FormatConfig{Label: "mloracle"})
@@ -500,7 +410,7 @@ func TestRelocMeta_MultiLevelKernelOracle(t *testing.T) {
 	if err := fs.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	kernelCheckAndMount(t, dir, img, files)
+	checkThenMount(t, dir, img, files)
 }
 
 // TestMultiLevelExtentTree_KernelOracle is the real kernel oracle for the
@@ -513,7 +423,7 @@ func TestRelocMeta_MultiLevelKernelOracle(t *testing.T) {
 // VM-validated 2026-06-23 in cb-tpm-ubuntu (btrfs-progs v6.6.3, kernel 6.17):
 // `btrfs check` "no error found" + loop-mount, all 200/150 files byte-identical.
 func TestMultiLevelExtentTree_KernelOracle(t *testing.T) {
-	requireKernelOracle(t)
+	requireBtrfsCheck(t)
 	dir := t.TempDir()
 	img := filepath.Join(dir, "ml-extent-oracle.img")
 	fs, err := Format(img, 64*1024*1024, FormatConfig{Label: "mlextoracle"})
@@ -542,7 +452,7 @@ func TestMultiLevelExtentTree_KernelOracle(t *testing.T) {
 	if err := r.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	kernelCheckAndMount(t, dir, img, files)
+	checkThenMount(t, dir, img, files)
 }
 
 // TestMultiLevelRootTree_KernelOracle is the real kernel oracle for relocating a
@@ -550,7 +460,7 @@ func TestMultiLevelExtentTree_KernelOracle(t *testing.T) {
 // (and its interior parent) must be COW-moved low, the superblock `root` pointer
 // re-seated, and the result `btrfs check`-clean and kernel-mountable. Gated.
 func TestMultiLevelRootTree_KernelOracle(t *testing.T) {
-	requireKernelOracle(t)
+	requireBtrfsCheck(t)
 	dir := t.TempDir()
 	img := filepath.Join(dir, "ml-root-oracle.img")
 	fs, err := Format(img, 24*1024*1024, FormatConfig{Label: "mlrootoracle"})
@@ -574,5 +484,5 @@ func TestMultiLevelRootTree_KernelOracle(t *testing.T) {
 	if err := fs.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	kernelCheckAndMount(t, dir, img, files)
+	checkThenMount(t, dir, img, files)
 }

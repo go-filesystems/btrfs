@@ -46,6 +46,15 @@ jobs:
           cache: true
           cache-dependency-path: btrfs/go.mod
 
+      # btrfs-progs is the foreign judge for the WRITE side: it reads back what
+      # our writer produced and says whether upstream accepts it. `btrfs check`
+      # operates on an image FILE and needs no privilege -- only the loop-mount
+      # half of each oracle does, and that half skips here. Without this the
+      # oracles' `btrfs check` never ran anywhere, because the only gate they
+      # had was root.
+      - name: btrfs-progs, as a foreign reader of our writes
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs
+
       - name: Build
         working-directory: btrfs
         env:
@@ -79,6 +88,10 @@ jobs:
           # margin. The quadratic growth itself is issue #12; raising this back
           # up is what that issue has to earn.
           BTRFS_STRESS_FILES: "2000"
+          # A skipped judge reads exactly like a passing one. The step above
+          # installs btrfs-progs, so its absence here is a broken lane, not a
+          # reason to go green quietly.
+          BTRFS_REQUIRE_PROGS: "1"
         run: go test -race -count=1 -covermode=atomic -coverprofile=cover.out -timeout=30m ./...
 
       - name: Gate coverage

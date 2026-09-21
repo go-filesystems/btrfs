@@ -318,22 +318,12 @@ func TestReloc_ReadFaultDuringRelocation(t *testing.T) {
 
 // TestReloc_KernelOracle is the real kernel oracle: it builds a fresh image,
 // drives the same relocation shrink, then runs `btrfs check` and loop-mounts
-// the result, asserting a clean check and byte-identical files. Skip-gated
-// unless root + btrfs-progs + mount/umount/losetup are available (CI runs it
-// only on the native Linux runners with the tools installed; macOS dev hosts
-// and emulated short runs skip it).
+// the result, asserting a clean check and byte-identical files.
+//
+// The `btrfs check` half needs btrfs-progs and no privilege, so it runs on the
+// native CI lanes. The loop-mount half needs root and runs as a named subtest.
 func TestReloc_KernelOracle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("kernel oracle is slow / needs root+tools; skipped in -short")
-	}
-	if os.Geteuid() != 0 {
-		t.Skip("kernel oracle needs root for losetup/mount")
-	}
-	for _, bin := range []string{"btrfs", "mount", "umount", "losetup"} {
-		if _, err := exec.LookPath(bin); err != nil {
-			t.Skipf("%s not on PATH; skipping kernel oracle", bin)
-		}
-	}
+	requireBtrfsCheck(t)
 
 	dir := t.TempDir()
 	img := filepath.Join(dir, "oracle.img")
@@ -373,27 +363,30 @@ func TestReloc_KernelOracle(t *testing.T) {
 	}
 
 	// Loop-mount and byte-compare.
-	loopOut, err := exec.Command("losetup", "--find", "--show", img).CombinedOutput()
-	if err != nil {
-		t.Fatalf("losetup: %v\n%s", err, loopOut)
-	}
-	loop := strings.TrimSpace(string(loopOut))
-	defer exec.Command("losetup", "-d", loop).Run()
-	mnt := filepath.Join(dir, "mnt")
-	if err := os.MkdirAll(mnt, 0o755); err != nil {
-		t.Fatalf("mkdir mnt: %v", err)
-	}
-	if mout, err := exec.Command("mount", "-o", "ro", loop, mnt).CombinedOutput(); err != nil {
-		t.Fatalf("mount: %v\n%s", err, mout)
-	}
-	defer exec.Command("umount", mnt).Run()
+	t.Run("kernel mount", func(t *testing.T) {
+		requireLoopMount(t)
+		loopOut, err := exec.Command("losetup", "--find", "--show", img).CombinedOutput()
+		if err != nil {
+			t.Fatalf("losetup: %v\n%s", err, loopOut)
+		}
+		loop := strings.TrimSpace(string(loopOut))
+		defer exec.Command("losetup", "-d", loop).Run()
+		mnt := filepath.Join(dir, "mnt")
+		if err := os.MkdirAll(mnt, 0o755); err != nil {
+			t.Fatalf("mkdir mnt: %v", err)
+		}
+		if mout, err := exec.Command("mount", "-o", "ro", loop, mnt).CombinedOutput(); err != nil {
+			t.Fatalf("mount: %v\n%s", err, mout)
+		}
+		defer exec.Command("umount", mnt).Run()
 
-	got, err := os.ReadFile(filepath.Join(mnt, "marker.bin"))
-	if err != nil || !bytes.Equal(got, marker) {
-		t.Fatalf("kernel-mounted relocated marker mismatch: err=%v len=%d want %d", err, len(got), len(marker))
-	}
-	gotBig, err := os.ReadFile(filepath.Join(mnt, "big.bin"))
-	if err != nil || !bytes.Equal(gotBig, []byte("small\n")) {
-		t.Fatalf("kernel-mounted big.bin mismatch: err=%v got=%q", err, gotBig)
-	}
+		got, err := os.ReadFile(filepath.Join(mnt, "marker.bin"))
+		if err != nil || !bytes.Equal(got, marker) {
+			t.Fatalf("kernel-mounted relocated marker mismatch: err=%v len=%d want %d", err, len(got), len(marker))
+		}
+		gotBig, err := os.ReadFile(filepath.Join(mnt, "big.bin"))
+		if err != nil || !bytes.Equal(gotBig, []byte("small\n")) {
+			t.Fatalf("kernel-mounted big.bin mismatch: err=%v got=%q", err, gotBig)
+		}
+	})
 }

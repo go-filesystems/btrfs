@@ -219,21 +219,13 @@ func TestDirSize_GenerateFixture(t *testing.T) {
 // TestDirSize_KernelOracle is the real kernel oracle: it builds a fresh image
 // with the delete/deletedir/rename mutations, runs `btrfs check`, and asserts a
 // clean result with NO "dir isize wrong", then loop-mounts and verifies the
-// surviving entries. Skip-gated unless root + btrfs-progs + mount/umount/losetup
-// are present (native Linux CI runners; macOS dev hosts and emulated short runs
-// skip it). Validated on cb-tpm-ubuntu (kernel 6.17 / btrfs-progs 6.6.3).
+// surviving entries.
+//
+// The `btrfs check` half needs btrfs-progs and no privilege, so it runs in CI.
+// The loop-mount half needs root and runs as a named subtest that skips on its
+// own. Validated on cb-tpm-ubuntu (kernel 6.17 / btrfs-progs 6.6.3).
 func TestDirSize_KernelOracle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("kernel oracle is slow / needs root+tools; skipped in -short")
-	}
-	if os.Geteuid() != 0 {
-		t.Skip("kernel oracle needs root for losetup/mount")
-	}
-	for _, bin := range []string{"btrfs", "mount", "umount", "losetup"} {
-		if _, err := exec.LookPath(bin); err != nil {
-			t.Skipf("%s not on PATH; skipping kernel oracle", bin)
-		}
-	}
+	requireBtrfsCheck(t)
 
 	dir := t.TempDir()
 	img := filepath.Join(dir, "oracle.img")
@@ -243,6 +235,8 @@ func TestDirSize_KernelOracle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("btrfs check failed: %v\n%s", err, out)
 	}
+	// The defect this oracle exists for: a directory whose isize double-counts
+	// its entries. btrfs-progs names it in plain words, so assert on the words.
 	if bytes.Contains(out, []byte("dir isize wrong")) {
 		t.Fatalf("btrfs check reported dir isize wrong:\n%s", out)
 	}
@@ -250,30 +244,33 @@ func TestDirSize_KernelOracle(t *testing.T) {
 		t.Fatalf("btrfs check reported errors:\n%s", out)
 	}
 
-	loopOut, err := exec.Command("losetup", "--find", "--show", img).CombinedOutput()
-	if err != nil {
-		t.Fatalf("losetup: %v\n%s", err, loopOut)
-	}
-	loop := string(bytes.TrimSpace(loopOut))
-	defer exec.Command("losetup", "-d", loop).Run()
-	mnt := filepath.Join(dir, "mnt")
-	if err := os.MkdirAll(mnt, 0o755); err != nil {
-		t.Fatalf("mkdir mnt: %v", err)
-	}
-	if mout, err := exec.Command("mount", "-o", "ro", loop, mnt).CombinedOutput(); err != nil {
-		t.Fatalf("mount: %v\n%s", err, mout)
-	}
-	defer exec.Command("umount", mnt).Run()
+	t.Run("kernel mount", func(t *testing.T) {
+		requireLoopMount(t)
+		loopOut, err := exec.Command("losetup", "--find", "--show", img).CombinedOutput()
+		if err != nil {
+			t.Fatalf("losetup: %v\n%s", err, loopOut)
+		}
+		loop := string(bytes.TrimSpace(loopOut))
+		defer exec.Command("losetup", "-d", loop).Run()
+		mnt := filepath.Join(dir, "mnt")
+		if err := os.MkdirAll(mnt, 0o755); err != nil {
+			t.Fatalf("mkdir mnt: %v", err)
+		}
+		if mout, err := exec.Command("mount", "-o", "ro", loop, mnt).CombinedOutput(); err != nil {
+			t.Fatalf("mount: %v\n%s", err, mout)
+		}
+		defer exec.Command("umount", mnt).Run()
 
-	for p, body := range dirsizeExpected {
-		got, err := os.ReadFile(filepath.Join(mnt, filepath.Base(p)))
-		if err != nil || string(got) != body {
-			t.Fatalf("kernel-mounted %s mismatch: err=%v got=%q want=%q", p, err, got, body)
+		for p, body := range dirsizeExpected {
+			got, err := os.ReadFile(filepath.Join(mnt, filepath.Base(p)))
+			if err != nil || string(got) != body {
+				t.Fatalf("kernel-mounted %s mismatch: err=%v got=%q want=%q", p, err, got, body)
+			}
 		}
-	}
-	for _, p := range dirsizeAbsent {
-		if _, err := os.Stat(filepath.Join(mnt, filepath.Base(p))); err == nil {
-			t.Errorf("kernel-mounted %s still present after removal", p)
+		for _, p := range dirsizeAbsent {
+			if _, err := os.Stat(filepath.Join(mnt, filepath.Base(p))); err == nil {
+				t.Errorf("kernel-mounted %s still present after removal", p)
+			}
 		}
-	}
+	})
 }

@@ -26,10 +26,16 @@ import (
 
 // requireBtrfsProgs skip-gates the test when the `btrfs` CLI (btrfs-progs)
 // is not on PATH. Returns the resolved absolute path on success.
+//
+// BTRFS_REQUIRE_PROGS=1 turns the skip into a failure. The native lanes set
+// it, because a judge that can quietly not run is not a control.
 func requireBtrfsProgs(t *testing.T) string {
 	t.Helper()
 	p, err := exec.LookPath("btrfs")
 	if err != nil {
+		if os.Getenv("BTRFS_REQUIRE_PROGS") != "" {
+			t.Fatalf("BTRFS_REQUIRE_PROGS is set but btrfs-progs is not installed: %v", err)
+		}
 		t.Skipf("btrfs CLI not found on PATH; install btrfs-progs to enable this cross-compat test (got: %v)", err)
 	}
 	return p
@@ -42,20 +48,24 @@ func requireBtrfsProgs(t *testing.T) string {
 // metadata node / data extent must be backed by an EXTENT_ITEM (with
 // backrefs) in the extent tree.
 //
-// Our writer is byte-correct at the node/superblock-checksum and tree-layout
-// level (validated by TestWriteThenBtrfsDumpSuper and by every read-side
-// round-trip against mkfs.btrfs images), but it does NOT yet maintain the
-// extent tree or the derived bytes_used accounting — Format() writes a
-// placeholder bytes_used and createFile/Grow/Shrink allocate space without
-// emitting EXTENT_ITEMs. Until that accounting lands, `btrfs check` rejects
-// the image with "invalid bytes_used" even though the data is fully
-// readable. Gate these tests on that pending work rather than asserting a
-// guarantee the writer doesn't make yet.
+// This used to skip UNCONDITIONALLY, saying the writer did not maintain the
+// extent tree or bytes_used and that `btrfs check` therefore rejected our
+// images with "invalid bytes_used". That was true when it was written. It has
+// not been true for some time: updateFsTreeRoot calls rebuildExtentTree, so
+// every write rebuilds the accounting, and the kernel oracles assert a CLEAN
+// `btrfs check` and pass.
+//
+// Nothing could tell the two claims apart, because no machine that ran the
+// tests had btrfs-progs installed. The 2026-09-21 lane installed it, and the
+// oracles -- including TestDirSize_KernelOracle, which does Format + writes +
+// Close with NO shrink, the same shape as the tests this gate held shut --
+// came back green on both native architectures.
+//
+// So the gate goes. A stale reason for a closed gate reads exactly like a
+// current one, and only running the thing tells them apart.
 func requireBtrfsCheckClean(t *testing.T) string {
 	t.Helper()
-	p := requireBtrfsProgs(t)
-	t.Skip("writer does not yet maintain the extent tree / bytes_used accounting that `btrfs check` validates; tracked as pending writer work. Superblock/node checksums and header layout are validated by TestWriteThenBtrfsDumpSuper.")
-	return p
+	return requireBtrfsProgs(t)
 }
 
 // runBtrfs executes the btrfs CLI with the given args and returns combined
@@ -79,7 +89,7 @@ func runBtrfs(t *testing.T, args ...string) ([]byte, error) {
 //
 // Skip-gated when btrfs-progs is unavailable (e.g. macOS dev hosts).
 func TestWriteThenBtrfsCheck(t *testing.T) {
-	requireBtrfsCheckClean(t) // skip: pending extent-tree/bytes_used accounting
+	requireBtrfsCheckClean(t)
 
 	img := filepath.Join(t.TempDir(), "writer-out.img")
 

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"path"
 	"strings"
 
@@ -91,7 +92,20 @@ func lookupDirEntry(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uin
 			}
 		}
 	}
-	return 0, 0, fmt.Errorf("btrfs: %q not found in inode %d: %w", name, dirIno, ErrNotFound)
+	// ⛔ This return, and ONLY this one, is a 404.
+	//
+	// btrfs raises ErrNotFound from two unrelated places: here, when a name is
+	// not in a directory, and from searchTree/collectPrefixItems when a B-tree
+	// descent finds no item. The second one, for the chunk tree or the root
+	// tree, means the image is corrupt -- so wrapping the SENTINEL would make
+	// every server in this family answer 404 for a broken filesystem and hide
+	// a real fault behind a routine one.
+	//
+	// By this line both B-tree errors above have already been discarded and
+	// the verdict rests on the name alone, which is what makes it safe to mark
+	// here. errnotexist_test.go guards both halves.
+	return 0, 0, fmt.Errorf("btrfs: %q not found in inode %d: %w: %w",
+		name, dirIno, ErrNotFound, iofs.ErrNotExist)
 }
 
 // pathLookup resolves an absolute path and returns the inode number.

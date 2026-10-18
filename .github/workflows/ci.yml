@@ -67,6 +67,23 @@ jobs:
           CGO_ENABLED: "0"
         run: go vet ./...
 
+      # ⛔ THE BENCHMARKS MODULE IS NOT IN `./...`, which is deliberate -- it
+      # is nested so the harness never affects the coverage floor -- and the
+      # cost was that nothing compiled it. Measured on 2026-10-18 across this
+      # fleet: of seventeen repositories with a nested `benchmarks` module that
+      # no lane builds, SIX did not compile at origin/main, this one among
+      # them, on a stale go.sum. Renovate updates the parent module and leaves
+      # the nested one behind, and nothing was watching the result.
+      #
+      # `go vet` rather than `go test`: a benchmark harness is a main package,
+      # and running it on a shared runner would measure the runner. Whether it
+      # compiles is the question.
+      - name: Vet the benchmarks module
+        working-directory: btrfs/benchmarks
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
       # Full (non-short) test pass with the race detector. The btrfs reader
       # has slow stress/resize tests gated behind testing.Short(); run them in
       # full here, so raise the timeout accordingly.

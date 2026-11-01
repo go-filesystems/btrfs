@@ -56,6 +56,15 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint6
 	outLen := len(out)
 	le := binary.LittleEndian
 
+	// prevEnd is where the previous regular extent's file range ended. The
+	// kernel refuses a leaf in which "file extent end range goes beyond start
+	// offset of the next file extent" (check_extent_data_item,
+	// fs/btrfs/tree-checker.c), and also refuses an end that overflows. A
+	// reader that does not check pays the whole extent again for every item
+	// that overlaps it: a leaf of tiny items each claiming the whole file made
+	// the read cost items x file size instead of file size.
+	var prevEnd uint64
+
 	for _, m := range items {
 		fileOffset := m.k.offset // byte offset within the file
 		// H2: a forged EXTENT_DATA key offset can exceed the file size; an
@@ -99,6 +108,12 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint6
 			if len(d) < extDataRegularSize {
 				continue
 			}
+			end := fileOffset + le.Uint64(d[extDataOffNumBytes:])
+			if end < fileOffset || fileOffset < prevEnd {
+				return nil, fmt.Errorf("btrfs: inode %d extent at file offset %d overlaps the previous extent (ends at %d): %w",
+					in.num, fileOffset, prevEnd, safeio.ErrOutOfBounds)
+			}
+			prevEnd = end
 			diskBytenr := le.Uint64(d[extDataOffDiskBytenr:])
 			if diskBytenr == 0 {
 				// Sparse extent — already zero.
@@ -224,7 +239,11 @@ func decompressExtent(src []byte, compression uint8, ramBytes uint64) ([]byte, e
 // by the kernel; ramBytes caps the output to defend against malformed
 // input.
 func decompressZstd(src []byte, ramBytes uint64) ([]byte, error) {
-	zr, err := zstd.NewReader(bytes.NewReader(src))
+	zr, err := zstd.NewReader(bytes.NewReader(src),
+		zstd.WithDecoderMaxWindow(zstdMaxWindow),
+		zstd.WithDecoderMaxMemory(zstdMaxWindow),
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderLowmem(true))
 	if err != nil {
 		return nil, fmt.Errorf("zstd reader: %w", err)
 	}

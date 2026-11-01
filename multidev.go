@@ -3,6 +3,8 @@ package filesystem_btrfs
 import (
 	"fmt"
 	"io"
+
+	"github.com/go-volumes/safeio"
 )
 
 // devicePool implements blockBackend on top of one or more leg devices
@@ -90,6 +92,19 @@ func (p *devicePool) ReadAt(buf []byte, off int64) (int, error) {
 		return p.primary.ReadAt(buf, off)
 	}
 	return p.readFromChunk(buf, logical, chunk)
+}
+
+// checkStripeLen refuses a striped chunk whose stripe_len is not the kernel's
+// BTRFS_STRIPE_LEN. The value is read from the chunk item, and the striped
+// readers split every read at stripe boundaries and recurse for the
+// remainder: with stripe_len = 1 a 64 KiB read was 65536 device reads and 65536
+// nested calls, and with stripe_len above 2^63 the remainder arithmetic went
+// negative and sliced the buffer out of range.
+func checkStripeLen(c *chunkMapping) error {
+	if c.stripeLen != btrfsStripeLen {
+		return fmt.Errorf("btrfs: chunk at log 0x%X has stripe_len %d, want %d: %w", c.logStart, c.stripeLen, btrfsStripeLen, safeio.ErrOutOfBounds)
+	}
+	return nil
 }
 
 // readFromChunk dispatches on chunk profile and reads from the appropriate
@@ -186,8 +201,8 @@ func (p *devicePool) readSingleOrMirror(buf []byte, logical uint64, c *chunkMapp
 // we just need to pick the data column, then map (col_in_row, row_nr) to
 // the device + per-device offset.
 func (p *devicePool) readStriped(buf []byte, logical uint64, c *chunkMapping, nparity int) (int, error) {
-	if c.stripeLen == 0 {
-		return 0, fmt.Errorf("btrfs: chunk at log 0x%X has stripeLen=0 (corrupt chunk_item?)", c.logStart)
+	if err := checkStripeLen(c); err != nil {
+		return 0, err
 	}
 	numStripes := len(c.stripes)
 	if numStripes <= nparity {
@@ -259,8 +274,8 @@ func (p *devicePool) readStriped(buf []byte, logical uint64, c *chunkMapping, np
 //	stripe_base   = group_idx * sub_stripes          // first leg of pair
 //	per_dev_off   = row_nr * stripe_len + stripe_off
 func (p *devicePool) readRAID10(buf []byte, logical uint64, c *chunkMapping) (int, error) {
-	if c.stripeLen == 0 {
-		return 0, fmt.Errorf("btrfs: RAID10 chunk at log 0x%X has stripeLen=0", c.logStart)
+	if err := checkStripeLen(c); err != nil {
+		return 0, err
 	}
 	subStripes := int(c.subStripes)
 	if subStripes < 2 {

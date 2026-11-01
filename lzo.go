@@ -51,7 +51,16 @@ func decompressLzo(src []byte, ramBytes uint64) ([]byte, error) {
 	if limit > maxDecompressRAM {
 		limit = maxDecompressRAM
 	}
+	// Structural bound: a segment costs at least 5 input bytes (its 4-byte
+	// length and one payload byte) and yields at most one page, so the output
+	// cannot exceed (totalSize/5 + 1) pages whatever ram_bytes claims. The
+	// slice grows by append from there instead of being sized up front from
+	// the declared size.
+	if maxOut := (uint64(totalSize)/5 + 1) * btrfsLzoPageSize; limit > maxOut {
+		limit = maxOut
+	}
 	out := make([]byte, 0, limit)
+	segOut := make([]byte, btrfsLzoPageSize)
 
 	in := 4
 	end := int(totalSize)
@@ -75,9 +84,8 @@ func decompressLzo(src []byte, ramBytes uint64) ([]byte, error) {
 		if uint64(segLen) > uint64(end-in) {
 			return nil, fmt.Errorf("lzo: segment length %d exceeds remaining %d", segLen, end-in)
 		}
-		// Each segment expands to at most one page; allocate exactly
-		// that much and let the decoder return the produced length.
-		segOut := make([]byte, btrfsLzoPageSize)
+		// Each segment expands to at most one page: one buffer of that
+		// size serves every segment, the decoder returns the length.
 		n, err := lzo.Decompress(src[in:in+int(segLen)], segOut)
 		if err != nil {
 			return nil, fmt.Errorf("lzo: segment at offset %d: %w", in-4, err)

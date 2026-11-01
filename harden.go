@@ -39,7 +39,30 @@ const (
 	// compressed extent. ram_bytes is fully attacker-controlled, so it is
 	// clamped to this ceiling (and to the remaining file size at the call
 	// site) before being used as a decompression output bound.
-	maxDecompressRAM = 1 << 30
+	//
+	// The bound is structural, not a guess: the kernel limits "the total size
+	// in ram of a compressed extent to 128k" (BTRFS_MAX_UNCOMPRESSED = SZ_128K
+	// in fs/btrfs/compression.h; the compressed form is capped at
+	// BTRFS_MAX_COMPRESSED = SZ_128K as well). It used to be 1 GiB, which let
+	// a 526 KiB zlib stream inflate to 256 MiB (600 MB allocated) per extent.
+	maxDecompressRAM = maxCompressedExtentRAM
+
+	maxCompressedExtentRAM = 128 * 1024
+
+	// zstdMaxWindow is the largest zstd window the kernel decodes a btrfs
+	// extent with: fs/btrfs/zstd.c initialises its decompression stream with
+	// ZSTD_BTRFS_MAX_INPUT = 1 << ZSTD_BTRFS_MAX_WINDOWLOG = 1 << 17. A frame
+	// header declaring a larger window is refused instead of being given the
+	// window it asks for (a 9-byte frame declaring 256 MiB made the decoder
+	// allocate 256 MiB).
+	zstdMaxWindow = 1 << 17
+
+	// btrfsStripeLen is the only stripe length the kernel accepts in a chunk
+	// item: check_chunk_item in fs/btrfs/tree-checker.c refuses any stripe_len
+	// that is not BTRFS_STRIPE_LEN (64 KiB). The striped readers recurse once
+	// per stripe, so a stripe_len of 1 turned a read into one device read and
+	// one stack frame per byte.
+	btrfsStripeLen = 64 * 1024
 )
 
 // deviceSize returns a sane allocation ceiling derived from the backing

@@ -40,6 +40,26 @@ https://btrfs.readthedocs.io/en/latest/
 - No online device add/remove or balance operations.
 - Intended for testing and tooling; not recommended for production use.
 
+## Untrusted input
+
+An image is attacker-controlled bytes. Every allocation, walk and recursion the
+driver sizes from a value read off the image is checked against what the format
+can produce **before** it happens (tests assert the allocation or the device-read
+count for each refused road). Bounds that come from the kernel source are cited
+in `harden.go`:
+
+| Input | Bound |
+|---|---|
+| compressed extent (`ram_bytes`, zlib / LZO / zstd) | 128 KiB: the kernel's `BTRFS_MAX_UNCOMPRESSED` (`fs/btrfs/compression.h`); LZO output capacity follows the input (one page per 5 input bytes), not the declared size |
+| zstd frame window | 128 KiB: the window the kernel decodes btrfs extents with (`ZSTD_BTRFS_MAX_WINDOWLOG`, `fs/btrfs/zstd.c`); a frame declaring more is refused |
+| file extent items | must not overlap (`check_extent_data_item`, `fs/btrfs/tree-checker.c`): an overlapping leaf cost items x file size to read |
+| chunk `stripe_len` (RAID0/5/6/10) | exactly 64 KiB (`check_chunk_item`): `stripe_len = 1` was one device read and one stack frame per byte |
+| file size, tree nodes, tree depth | device size, 2^20 nodes, 64 levels (unchanged) |
+
+Fuzz targets: `FuzzDecompressExtent`, `FuzzStripedRead` (allocation and device-read
+count stay proportional to the input), plus `FuzzMountImage`, `FuzzReadFileData`,
+`FuzzMountPatched`.
+
 ## Supported operations
 
 | Operation    | Status         |

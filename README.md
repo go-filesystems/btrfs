@@ -21,6 +21,7 @@ https://btrfs.readthedocs.io/en/latest/
 | Open / Close | ✅ | Single-device images; `OpenFromDevice`/`OpenFromDevices` for layered/multi-device backends |
 | Format | ✅ | Creates a new single-device Btrfs image |
 | ReadFile / WriteFile | ✅ | Full file I/O supported |
+| OpenFile (`filesystem.Opener`), also on a subvolume | ✅ | Positional reads: the file's extent items are collected at open, each `ReadAt` reads (and, for a compressed extent, decompresses) only the extents of its window. A 1 MiB read at 66 MiB of a 72 MiB file allocates nothing through it and 75.5 MB through `ReadFile` |
 | MkDir / Delete / Rename | ✅ | Directory and rename operations supported |
 | ReadLink / Symlinks | ✅ | Read + create (`FS.Symlink`) |
 | Hardlinks | ✅ | `FS.Link` |

@@ -168,12 +168,17 @@ func findLeafContainingPrefix(r io.ReaderAt, partOff int64, sb *superblock,
 			if k.objID > objID || (k.objID == objID && k.typ > typ) {
 				continue
 			}
-			// Skip subtrees whose entire range is before our prefix only if
-			// the NEXT child's first key is still before our prefix — i.e. all
-			// items in this subtree are strictly less than (objID, typ, 0).
-			// We can only skip if i+1 is in range AND its key is still < our
-			// target; the leftmost child whose first key precedes the target
-			// may still contain matching items, so include it.
+			// Skip subtrees whose entire range is before our prefix: child i
+			// holds keys below child i+1's first key, so when that key is not
+			// past (objID, typ, 0) nothing in child i can match. The leftmost
+			// child whose NEXT key is past the target may still hold matches
+			// and is kept. (The comment said this and the code did not: every
+			// delete read all the leaves to the left of its target.)
+			if i+1 < int(hdr.nItems) && off+2*keyPtrSize <= len(buf) {
+				if next := readKey(buf[off+keyPtrSize:]); compareKeys(next, objID, typ, 0) <= 0 {
+					continue
+				}
+			}
 			childLog := le.Uint64(buf[off+17:])
 			stack = append(stack, frame{logAddr: childLog, depth: top.depth + 1})
 		}

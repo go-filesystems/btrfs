@@ -96,10 +96,12 @@ func truncateInode(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 			copy(trimmed[extDataHdrSize:], d[extDataHdrSize:extDataHdrSize+int(kept)])
 			le.PutUint64(trimmed[extDataOffRamBytes:], kept)
 		} else {
+			// ram_bytes stays (it describes the whole extent); num_bytes is the
+			// kept span rounded up to the sector size, as the kernel's
+			// tree-checker requires of a regular extent.
 			trimmed = make([]byte, len(d))
 			copy(trimmed, d)
-			le.PutUint64(trimmed[extDataOffRamBytes:], kept)
-			le.PutUint64(trimmed[extDataOffNumBytes:], kept)
+			le.PutUint64(trimmed[extDataOffNumBytes:], alignUp(kept, uint64(sb.sectorSize)))
 		}
 		newRoot, uerr := cowUpdate(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, m.k, trimmed)
 		if uerr != nil {

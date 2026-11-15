@@ -49,11 +49,12 @@ The Linux kernel (6.17) and btrfs-progs 6.6.3, run as root in a Tart VM by
 `FS_KERNEL_JUDGE=1`). Each image is held to a fixed corpus (nested directories,
 UTF-8 names, sparse and 32 MiB files, symlinks, xattrs, times) by `btrfs check
 --readonly`, a read-only kernel mount and this reader, for images written by this
-driver and, in reverse, by `mkfs.btrfs` plus a kernel read-write mount (clean).
-Open defects found this way, logged as `KNOWN DEFECT` by the test:
-[#39](https://github.com/go-filesystems/btrfs/issues/39) (file sizes that are
-not a multiple of 4096: the kernel refuses the filesystem),
-[#40](https://github.com/go-filesystems/btrfs/issues/40) (empty file),
+driver and, in reverse, by `mkfs.btrfs` plus a kernel read-write mount: both
+directions are clean, with no known defect. It found, and this release fixed,
+[#39](https://github.com/go-filesystems/btrfs/issues/39) (extent fields not a
+multiple of the sector size: the kernel refused the filesystem),
+[#40](https://github.com/go-filesystems/btrfs/issues/40) (an empty file carried
+an EXTENT_DATA item) and
 [#41](https://github.com/go-filesystems/btrfs/issues/41) (xattr item type).
 Against the kernel on one image (4000 small files, a 256 MiB file): metadata walk
 10369 files/s against 82447 for the kernel; the sequential read figure is not a

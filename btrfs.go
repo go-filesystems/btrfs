@@ -74,6 +74,7 @@ const (
 	ftRegFile uint8 = 1
 	ftDir     uint8 = 2
 	ftSymlink uint8 = 7
+	ftXattr   uint8 = 8 // BTRFS_FT_XATTR
 
 	// Extent data type.
 	extentDataInline  uint8 = 0

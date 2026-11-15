@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"path/filepath"
 	"testing"
 )
@@ -166,4 +167,45 @@ func TestTruncateKeepsExtentNumBytesAligned(t *testing.T) {
 	if got, err := f.ReadFile("/t"); err != nil || len(got) != 5000 {
 		t.Fatalf("read back %d bytes, %v", len(got), err)
 	}
+}
+
+func TestExtentLookupDoesNotDescendIntoLeavesLeftOfItsTarget(t *testing.T) {
+	f, b := openForItems(t)
+	const files = 700
+	for i := 0; i < files; i++ {
+		if err := f.WriteFile(fmt.Sprintf("/f%04d", i), pattern(3000), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ino := func(i int) uint64 {
+		in, err := pathLookup(b.f, b.partOffset, b.sb, b.fsTreeRoot, fmt.Sprintf("/f%04d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return in.num
+	}
+	cost := func(num uint64) int {
+		n := 0
+		r := &leafReadCounter{ReaderAt: b.f, n: &n}
+		if _, err := collectPrefixItems(r, b.partOffset, b.sb, b.fsTreeRoot, num, typeExtentData); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	first, last := cost(ino(0)), cost(ino(files-1))
+	// The tree has many leaves (3 items per file); reaching the last file must
+	// cost about what reaching the first does, not a read of every leaf before it.
+	if last > first+4 {
+		t.Errorf("collectPrefixItems for the last of %d files read %d times, the first %d: it walks the leaves to its left", files, last, first)
+	}
+}
+
+type leafReadCounter struct {
+	io.ReaderAt
+	n *int
+}
+
+func (r *leafReadCounter) ReadAt(p []byte, off int64) (int, error) {
+	*r.n++
+	return r.ReaderAt.ReadAt(p, off)
 }

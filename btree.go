@@ -321,6 +321,17 @@ func walkPrefixLeaves(r io.ReaderAt, partOff int64, sb *superblock,
 			if k.objID > wantObjID || (k.objID == wantObjID && k.typ > wantType) {
 				break
 			}
+			// ... and the ones whose ENTIRE range lies BEFORE it: child i holds
+			// keys below child i+1's first key, so when that key is not past the
+			// first possible (objID, typ, 0) the child cannot hold a match.
+			// Without this every lookup descended into all the leaves to the
+			// left of its target, so reading N files read O(N^2) leaves (the
+			// metadata walk was 7.9x slower than the kernel, #44).
+			if i+1 < hdr.nItems && off+2*keyPtrSize <= len(buf) {
+				if next := readKey(buf[off+keyPtrSize:]); compareKeys(next, wantObjID, wantType, 0) <= 0 {
+					continue
+				}
+			}
 			childLog := le.Uint64(buf[off+17:])
 			children = append(children, childLog)
 		}

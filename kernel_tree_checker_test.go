@@ -245,3 +245,30 @@ func TestFindLeafContainingPrefixDoesNotDescendLeft(t *testing.T) {
 		t.Errorf("findLeafContainingPrefix for the last of %d files read %d times, the first %d", files, last, first)
 	}
 }
+
+// Deleting from a multi-leaf tree goes through findLeafContainingPrefix: the
+// files that stay must read back intact (review of the skip).
+func TestPartialDeleteInAMultiLeafTreeKeepsTheRest(t *testing.T) {
+	f, _ := openForItems(t)
+	const files = 400
+	for i := 0; i < files; i++ {
+		if err := f.WriteFile(fmt.Sprintf("/h%04d", i), pattern(2500+i), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < files; i += 2 {
+		if err := f.DeleteFile(fmt.Sprintf("/h%04d", i)); err != nil {
+			t.Fatalf("delete %d: %v", i, err)
+		}
+	}
+	for i := 1; i < files; i += 2 {
+		got, err := f.ReadFile(fmt.Sprintf("/h%04d", i))
+		if err != nil || !bytes.Equal(got, pattern(2500+i)) {
+			t.Fatalf("file %d after the deletes: %v", i, err)
+		}
+	}
+	ents, err := f.ListDir("/")
+	if err != nil || len(ents) != files/2 {
+		t.Fatalf("ListDir: %d entries, %v; want %d", len(ents), err, files/2)
+	}
+}

@@ -209,3 +209,39 @@ func (r *leafReadCounter) ReadAt(p []byte, off int64) (int, error) {
 	*r.n++
 	return r.ReaderAt.ReadAt(p, off)
 }
+
+// findLeafContainingPrefix (used by delete) had the same descent into every
+// leaf left of its target as the read walk: its comment described a skip the code
+// did not do. Also pins the boundary: a parent key exactly (objID, typ, 0).
+func TestFindLeafContainingPrefixDoesNotDescendLeft(t *testing.T) {
+	f, b := openForItems(t)
+	const files = 700
+	for i := 0; i < files; i++ {
+		if err := f.WriteFile(fmt.Sprintf("/g%04d", i), pattern(3000), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cost := func(i int) (int, bool) {
+		in, err := pathLookup(b.f, b.partOffset, b.sb, b.fsTreeRoot, fmt.Sprintf("/g%04d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		r := &leafReadCounter{ReaderAt: b.f, n: &n}
+		buf, _, err := findLeafContainingPrefix(r, b.partOffset, b.sb, b.fsTreeRoot, in.num, typeExtentData)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n, buf != nil
+	}
+	for _, i := range []int{0, files / 2, files - 1} {
+		if _, found := cost(i); !found {
+			t.Fatalf("file %d: no leaf found for its extent items", i)
+		}
+	}
+	first, _ := cost(0)
+	last, _ := cost(files - 1)
+	if last > first+4 {
+		t.Errorf("findLeafContainingPrefix for the last of %d files read %d times, the first %d", files, last, first)
+	}
+}

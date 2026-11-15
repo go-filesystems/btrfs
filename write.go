@@ -378,12 +378,8 @@ func writeExtents(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 	ino uint64, data []byte, generation uint64,
 ) error {
 	if len(data) == 0 {
-		extData := encodeExtentDataInline(nil, generation)
-		newRoot, err := cowInsert(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, key{ino, typeExtentData, 0}, extData)
-		if err != nil {
-			return fmt.Errorf("insert empty extent: %w", err)
-		}
-		*fsTreeRoot = newRoot
+		// A file of size 0 has no EXTENT_DATA item (the kernel writes none, and
+		// `btrfs check` reports "bad file extent" for an empty inline one).
 		return nil
 	}
 	// Inline fast path: tiny files live entirely inside the EXTENT_DATA
@@ -405,7 +401,7 @@ func writeExtents(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 	// all. The reader treats diskBytenr=0 as zero-filled and produces the
 	// right bytes without ever touching disk.
 	if isAllZero(data) {
-		extData := encodeExtentData(0, 0, 0, uint64(len(data)), generation)
+		extData := encodeExtentData(0, 0, 0, uint64(len(data)), generation, uint64(sb.sectorSize))
 		newRoot, err := cowInsert(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, key{ino, typeExtentData, 0}, extData)
 		if err != nil {
 			return fmt.Errorf("insert sparse extent: %w", err)
@@ -418,8 +414,11 @@ func writeExtents(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 		if _, werr := rwaAt.WriteAt(data, partOff+int64(physData)); werr != nil {
 			return fmt.Errorf("write data: %w", werr)
 		}
+		if err := zeroSectorTail(rwaAt, partOff+int64(physData), uint64(len(data)), uint64(sb.sectorSize)); err != nil {
+			return err
+		}
 		logData := physToLog(sb, physData)
-		extData := encodeExtentData(logData, physSize, 0, uint64(len(data)), generation)
+		extData := encodeExtentData(logData, physSize, 0, uint64(len(data)), generation, uint64(sb.sectorSize))
 		newRoot, ierr := cowInsert(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, key{ino, typeExtentData, 0}, extData)
 		if ierr != nil {
 			return fmt.Errorf("insert extent: %w", ierr)
@@ -442,8 +441,11 @@ func writeExtents(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 		if _, werr := rwaAt.WriteAt(data[fileOffset:fileOffset+chunk], partOff+int64(phys)); werr != nil {
 			return fmt.Errorf("write data chunk at file offset %d: %w", fileOffset, werr)
 		}
+		if err := zeroSectorTail(rwaAt, partOff+int64(phys), chunk, uint64(sb.sectorSize)); err != nil {
+			return err
+		}
 		logData := physToLog(sb, phys)
-		extData := encodeExtentData(logData, allocated, 0, chunk, generation)
+		extData := encodeExtentData(logData, allocated, 0, chunk, generation, uint64(sb.sectorSize))
 		newRoot, ierr := cowInsert(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, key{ino, typeExtentData, fileOffset}, extData)
 		if ierr != nil {
 			return fmt.Errorf("insert extent at file offset %d: %w", fileOffset, ierr)
@@ -580,7 +582,30 @@ func freeInodeExtents(r io.ReaderAt, partOff int64, sb *superblock, sm *spaceMan
 	}
 }
 
-func encodeExtentData(diskBytenr, diskNumBytes, fileOffset, numBytes, generation uint64) []byte {
+// zeroSectorTail zeroes the bytes of the last sector of a file that follow its
+// data: an extent's num_bytes is now a whole number of sectors, so a later
+// growth of the file reads this tail, and it must not hold a previous file's
+// bytes from a reused extent.
+func zeroSectorTail(w io.WriterAt, at int64, length, sector uint64) error {
+	if pad := alignUp(length, sector) - length; pad > 0 {
+		if _, err := w.WriteAt(make([]byte, pad), at+int64(length)); err != nil {
+			return fmt.Errorf("zero sector tail: %w", err)
+		}
+	}
+	return nil
+}
+
+// alignUp rounds n up to a multiple of unit (a power of two).
+func alignUp(n, unit uint64) uint64 { return (n + unit - 1) &^ (unit - 1) }
+
+// encodeExtentData encodes a regular (or hole) EXTENT_DATA item. The kernel's
+// tree-checker (check_extent_data_item, fs/btrfs/tree-checker.c) requires
+// ram_bytes, disk_bytenr, disk_num_bytes, offset and num_bytes of a regular
+// extent to be multiples of the sector size, so numBytes is rounded up here:
+// the file's real length lives in the inode's size, and the reader clips every
+// extent to it.
+func encodeExtentData(diskBytenr, diskNumBytes, fileOffset, numBytes, generation, sectorSize uint64) []byte {
+	numBytes = alignUp(numBytes, sectorSize)
 	buf := make([]byte, extDataRegularSize)
 	le := binary.LittleEndian
 	le.PutUint64(buf[0x00:], generation)

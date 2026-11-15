@@ -35,19 +35,7 @@ func kernelJudgeDriver() kj.Driver {
 			}
 			return st.MTime, nil
 		},
-		// Defects that hide the rest of an image get a variant without them:
-		// unaligned file sizes, xattrs, and an empty file.
-		Variants: []kj.Variant{{
-			Name: "aligned-plain",
-			Opts: func(o *kj.Options) { o.SizeAlign = 4096; o.Caps.Xattrs = false },
-			Map: func(e kj.Entry) (kj.Entry, bool) {
-				return e, !(e.Kind == kj.File && e.Size == 0)
-			},
-		}},
-		Known: []kj.Known{
-			{Test: `/write$`, Match: `^(fsck btrfs|kernel mount):`, Issue: "btrfs#39, #40, #41"},
-		},
-		Mkfs: []string{"mkfs.btrfs", "-q", "-f", "{img}"},
+		Mkfs:    []string{"mkfs.btrfs", "-q", "-f", "{img}"},
 		Fsck:    [][]string{{"btrfs", "check", "--readonly", "{img}"}},
 		Compare: kj.Compare{Mtime: true, Xattrs: true, Perm: true},
 	}

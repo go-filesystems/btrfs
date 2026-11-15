@@ -8,12 +8,14 @@ import (
 
 // encodeXattrItemPayload constructs the on-disk bytes of an XATTR_ITEM,
 // which reuses the btrfs_dir_item layout: 30-byte header + name + value.
-// The header fields not relevant to xattrs (location_objid/type/transid,
-// dir-item file-type byte) are left zero.
+// The location key and transid are left zero, but the dir-item file-type byte
+// must be BTRFS_FT_XATTR (8): check_dir_item (fs/btrfs/tree-checker.c) refuses
+// an XATTR_ITEM_KEY item of any other type, and with it the whole leaf.
 func encodeXattrItemPayload(name string, value []byte) []byte {
 	nameBytes := []byte(name)
 	buf := make([]byte, dirItemHdrSize+len(nameBytes)+len(value))
 	le := binary.LittleEndian
+	buf[0x1D] = ftXattr                              // dir type, after data_len (0x19) and name_len (0x1B)
 	le.PutUint16(buf[0x19:], uint16(len(value)))     // data_len
 	le.PutUint16(buf[0x1B:], uint16(len(nameBytes))) // name_len
 	copy(buf[dirItemHdrSize:], nameBytes)

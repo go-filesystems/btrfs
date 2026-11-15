@@ -1,6 +1,7 @@
 package filesystem_btrfs
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"path/filepath"
@@ -26,7 +27,7 @@ func TestRegularExtentFieldsAreSectorAligned(t *testing.T) {
 	f, b := openForItems(t)
 	for _, n := range []int{2049, 4095, 4097, 65537, 100000} {
 		p := fmt.Sprintf("/f%d", n)
-		if err := f.WriteFile(p, make([]byte, n), 0o644); err != nil {
+		if err := f.WriteFile(p, pattern(n), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		in, err := pathLookup(b.f, b.partOffset, b.sb, b.fsTreeRoot, p)
@@ -48,9 +49,62 @@ func TestRegularExtentFieldsAreSectorAligned(t *testing.T) {
 			}
 		}
 		got, err := f.ReadFile(p)
-		if err != nil || len(got) != n {
-			t.Fatalf("%d bytes read back as %d (%v)", n, len(got), err)
+		if err != nil || !bytes.Equal(got, pattern(n)) {
+			t.Fatalf("%d bytes read back as %d different bytes (%v)", n, len(got), err)
 		}
+	}
+}
+
+// pattern is non-zero data: all-zero data takes the hole path and would test
+// nothing of the data extents.
+func pattern(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i%251 + 1)
+	}
+	return b
+}
+
+func TestShrinkThenGrowReadsZeros(t *testing.T) {
+	f, _ := openForItems(t)
+	if err := f.WriteFile("/g", pattern(20000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate("/g", 5000); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate("/g", 8000); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.ReadFile("/g")
+	if err != nil || len(got) != 8000 {
+		t.Fatalf("%d bytes, %v", len(got), err)
+	}
+	if !bytes.Equal(got[:5000], pattern(5000)) {
+		t.Error("the kept bytes changed")
+	}
+	if !bytes.Equal(got[5000:], make([]byte, 3000)) {
+		t.Error("bytes 5000..8000 are not zero: the discarded data came back")
+	}
+}
+
+func TestReusedExtentTailDoesNotLeakIntoAGrownFile(t *testing.T) {
+	f, _ := openForItems(t)
+	if err := f.WriteFile("/old", pattern(20000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.DeleteFile("/old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.WriteFile("/new", pattern(5000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate("/new", 8000); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := f.ReadFile("/new")
+	if len(got) != 8000 || !bytes.Equal(got[5000:], make([]byte, 3000)) {
+		t.Error("the grown tail holds bytes of the deleted file")
 	}
 }
 
@@ -94,7 +148,7 @@ func TestXattrItemHasTheXattrDirType(t *testing.T) {
 
 func TestTruncateKeepsExtentNumBytesAligned(t *testing.T) {
 	f, b := openForItems(t)
-	if err := f.WriteFile("/t", make([]byte, 20000), 0o644); err != nil {
+	if err := f.WriteFile("/t", pattern(20000), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Truncate("/t", 5000); err != nil {
@@ -103,8 +157,10 @@ func TestTruncateKeepsExtentNumBytesAligned(t *testing.T) {
 	in, _ := pathLookup(b.f, b.partOffset, b.sb, b.fsTreeRoot, "/t")
 	items, _ := collectPrefixItems(b.f, b.partOffset, b.sb, b.fsTreeRoot, in.num, typeExtentData)
 	for _, m := range items {
-		if v := binary.LittleEndian.Uint64(m.data[extDataOffNumBytes:]); v%uint64(b.sb.sectorSize) != 0 {
-			t.Errorf("num_bytes %d after truncate is not sector aligned", v)
+		for name, off := range map[string]int{"ram_bytes": extDataOffRamBytes, "num_bytes": extDataOffNumBytes, "offset": extDataOffOffset} {
+			if v := binary.LittleEndian.Uint64(m.data[off:]); v%uint64(b.sb.sectorSize) != 0 {
+				t.Errorf("%s %d after truncate is not sector aligned", name, v)
+			}
 		}
 	}
 	if got, err := f.ReadFile("/t"); err != nil || len(got) != 5000 {

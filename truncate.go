@@ -101,7 +101,20 @@ func truncateInode(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 			// tree-checker requires of a regular extent.
 			trimmed = make([]byte, len(d))
 			copy(trimmed, d)
-			le.PutUint64(trimmed[extDataOffNumBytes:], alignUp(kept, uint64(sb.sectorSize)))
+			newNum := alignUp(kept, uint64(sb.sectorSize))
+			le.PutUint64(trimmed[extDataOffNumBytes:], newNum)
+			// The kept span now ends mid-sector: zero the rest of that sector on
+			// disk (the kernel's btrfs_truncate_block does the same), or a later
+			// growth of the file would read the discarded bytes back.
+			if diskBytenr := le.Uint64(d[extDataOffDiskBytenr:]); diskBytenr != 0 && d[extDataOffCompression] == compressionNone && newNum > kept {
+				phys, perr := sb.physAddr(partOff, diskBytenr+le.Uint64(d[extDataOffOffset:])+kept)
+				if perr != nil {
+					return fmt.Errorf("btrfs truncate: locate extent tail: %w", perr)
+				}
+				if _, werr := rwaAt.WriteAt(make([]byte, newNum-kept), phys); werr != nil {
+					return fmt.Errorf("btrfs truncate: zero extent tail: %w", werr)
+				}
+			}
 		}
 		newRoot, uerr := cowUpdate(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, m.k, trimmed)
 		if uerr != nil {
@@ -122,6 +135,11 @@ func truncateInode(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 		if scanErr == nil {
 			for _, m := range items {
 				ed := m.data
+				if len(ed) > extDataOffType && ed[extDataOffType] == extentDataInline {
+					// btrfs check counts an inline extent's ram_bytes.
+					nbytes += le.Uint64(ed[extDataOffRamBytes:])
+					continue
+				}
 				if len(ed) < extDataRegularSize {
 					continue
 				}
@@ -132,7 +150,7 @@ func truncateInode(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 				if diskBytenr == 0 {
 					continue // sparse
 				}
-				nbytes += le.Uint64(ed[extDataOffDiskNumBytes:])
+				nbytes += le.Uint64(ed[extDataOffNumBytes:])
 			}
 		}
 		le.PutUint64(d[inodeOffNBytes:], nbytes)

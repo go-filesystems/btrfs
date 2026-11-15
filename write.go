@@ -414,6 +414,9 @@ func writeExtents(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 		if _, werr := rwaAt.WriteAt(data, partOff+int64(physData)); werr != nil {
 			return fmt.Errorf("write data: %w", werr)
 		}
+		if err := zeroSectorTail(rwaAt, partOff+int64(physData), uint64(len(data)), uint64(sb.sectorSize)); err != nil {
+			return err
+		}
 		logData := physToLog(sb, physData)
 		extData := encodeExtentData(logData, physSize, 0, uint64(len(data)), generation, uint64(sb.sectorSize))
 		newRoot, ierr := cowInsert(rws, rwaAt, partOff, sb, sm, *fsTreeRoot, key{ino, typeExtentData, 0}, extData)
@@ -437,6 +440,9 @@ func writeExtents(rwaAt readerWriterAt, rws readerWriterAt, partOff int64,
 		}
 		if _, werr := rwaAt.WriteAt(data[fileOffset:fileOffset+chunk], partOff+int64(phys)); werr != nil {
 			return fmt.Errorf("write data chunk at file offset %d: %w", fileOffset, werr)
+		}
+		if err := zeroSectorTail(rwaAt, partOff+int64(phys), chunk, uint64(sb.sectorSize)); err != nil {
+			return err
 		}
 		logData := physToLog(sb, phys)
 		extData := encodeExtentData(logData, allocated, 0, chunk, generation, uint64(sb.sectorSize))
@@ -574,6 +580,19 @@ func freeInodeExtents(r io.ReaderAt, partOff int64, sb *superblock, sm *spaceMan
 		}
 		sm.freeRange(uint64(phys), diskNumBytes)
 	}
+}
+
+// zeroSectorTail zeroes the bytes of the last sector of a file that follow its
+// data: an extent's num_bytes is now a whole number of sectors, so a later
+// growth of the file reads this tail, and it must not hold a previous file's
+// bytes from a reused extent.
+func zeroSectorTail(w io.WriterAt, at int64, length, sector uint64) error {
+	if pad := alignUp(length, sector) - length; pad > 0 {
+		if _, err := w.WriteAt(make([]byte, pad), at+int64(length)); err != nil {
+			return fmt.Errorf("zero sector tail: %w", err)
+		}
+	}
+	return nil
 }
 
 // alignUp rounds n up to a multiple of unit (a power of two).

@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	lzo "github.com/anchore/go-lzo"
+	"github.com/go-compressions/lzo"
 )
 
 // Btrfs LZO framing layer.
@@ -22,8 +22,8 @@ import (
 // 4-byte header would cross a page boundary, the encoder pads to the next
 // page-aligned offset and the decoder mirrors that rule.
 //
-// The actual LZO1X-1 decoder lives in github.com/anchore/go-lzo (MIT
-// licensed, pure Go, derived from the kernel docs and the lzokay reference).
+// The LZO1X decoder is the fleet's, github.com/go-compressions/lzo (BSD-3,
+// pure Go, DecodeBlock, checked against liblzo2 blocks).
 
 // btrfsLzoPageSize is the on-disk page size used by the btrfs LZO framing.
 // btrfs-progs hardcodes 4096; we match that producer behavior.
@@ -86,7 +86,7 @@ func decompressLzo(src []byte, ramBytes uint64) ([]byte, error) {
 		}
 		// Each segment expands to at most one page: one buffer of that
 		// size serves every segment, the decoder returns the length.
-		n, err := lzo.Decompress(src[in:in+int(segLen)], segOut)
+		n, err := lzo.DecodeBlock(segOut, src[in:in+int(segLen)])
 		if err != nil {
 			return nil, fmt.Errorf("lzo: segment at offset %d: %w", in-4, err)
 		}

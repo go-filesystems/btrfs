@@ -248,7 +248,18 @@ func decompressZstd(src []byte, ramBytes uint64) ([]byte, error) {
 		return nil, fmt.Errorf("zstd reader: %w", err)
 	}
 	defer zr.Close()
-	out, err := io.ReadAll(io.LimitReader(zr, decompressLimit(ramBytes)))
+	// A kernel zstd extent is ONE frame followed by zero padding to the sector
+	// size (fs/btrfs/zstd.c, zstd_decompress_bio: it decompresses until the
+	// output of ram_bytes is complete and never looks at the bytes after the
+	// frame). Reading one byte past ram_bytes, as a "stream is longer than
+	// declared" probe, makes the decoder parse the padding as a second frame
+	// and fail with "magic number mismatch". So stop at exactly ramBytes: output
+	// is still bounded by it, and a frame that ends early is caught by the
+	// caller's window check.
+	if ramBytes > maxDecompressRAM {
+		ramBytes = maxDecompressRAM
+	}
+	out, err := io.ReadAll(io.LimitReader(zr, int64(ramBytes)))
 	if err != nil {
 		return nil, fmt.Errorf("zstd decompress: %w", err)
 	}

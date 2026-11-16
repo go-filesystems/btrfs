@@ -11,7 +11,7 @@ require (
 )
 
 require (
-	github.com/anchore/go-lzo v0.1.1 // indirect
+	github.com/go-compressions/lzo v0.3.1-0.20261116142323-a40d051bdbff // indirect
 	github.com/go-volumes/gpt v0.3.0 // indirect
 	github.com/go-volumes/safeio v0.0.0-20261011024942-5635ea21db3b // indirect
 	github.com/klauspost/compress v1.20.3 // indirect

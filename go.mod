@@ -3,7 +3,7 @@ module github.com/go-filesystems/btrfs
 go 1.27.1
 
 require (
-	github.com/anchore/go-lzo v0.1.1
+	github.com/go-compressions/lzo v0.3.1-0.20261116142323-a40d051bdbff
 	github.com/go-filesystems/interface v0.6.0
 	github.com/go-filesystems/kerneljudge v0.3.1
 	github.com/go-volumes/gpt v0.3.0

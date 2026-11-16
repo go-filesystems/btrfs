@@ -249,9 +249,9 @@ func decompressZstd(src []byte, ramBytes uint64) ([]byte, error) {
 	}
 	defer zr.Close()
 	// A kernel zstd extent is ONE frame followed by zero padding to the sector
-	// size (fs/btrfs/zstd.c, zstd_decompress_bio: it decompresses until the
-	// output of ram_bytes is complete and never looks at the bytes after the
-	// frame). Reading one byte past ram_bytes, as a "stream is longer than
+	// size (Linux v6.17 fs/btrfs/zstd.c, zstd_decompress_bio, lines 630-640:
+	// it leaves its loop once the output is complete or at the end of the
+	// frame, and never looks at the bytes after it). Reading one byte past ram_bytes, as a "stream is longer than
 	// declared" probe, makes the decoder parse the padding as a second frame
 	// and fail with "magic number mismatch". So stop at exactly ramBytes: output
 	// is still bounded by it, and a frame that ends early is caught by the

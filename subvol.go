@@ -331,7 +331,7 @@ func (v *subvolView) ReadFile(path string) ([]byte, error) {
 	if !in.isRegular() {
 		return nil, fmt.Errorf("btrfs: %q is not a regular file", path)
 	}
-	return readFileData(r, p.partOffset, p.sb, v.fsTreeRoot, in)
+	return readFileDataN(r, p.partOffset, p.sb, v.fsTreeRoot, in, p.readWorkers())
 }
 
 func (v *subvolView) ListDir(path string) ([]filesystem.DirEntry, error) {

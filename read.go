@@ -32,10 +32,46 @@ const (
 	extDataRegularSize     = extDataHdrSize + 0x20 // 0x35 total for regular
 )
 
-// readFileData reads and reassembles the full content of a regular file.
-// Extent items are collected via collectPrefixItems so files whose
-// EXTENT_DATA items span multiple leaves still read fully.
+// readFileData reads and reassembles the full content of a regular file, with
+// the default read parallelism (see SetReadParallelism).
 func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint64, in *inodeItem) ([]byte, error) {
+	return readFileDataN(r, partOff, sb, fsTreeRoot, in, defaultReadParallelism())
+}
+
+// extent job kinds of a file read.
+const (
+	jobFail       = iota // a planning error: the job reports it, in file order
+	jobInline            // inline data (possibly compressed), decoded in work
+	jobRaw               // an uncompressed regular extent, read in emit
+	jobCompressed        // a compressed regular extent, read and decoded in work
+)
+
+// readJob is one extent item of a file read, validated by the serial planning
+// pass; work and emit are pure functions of it.
+type readJob struct {
+	kind         int
+	err          error // jobFail
+	fileOffset   uint64
+	remaining    uint64 // file bytes from fileOffset to EOF
+	numBytes     uint64
+	extOffset    uint64
+	diskBytenr   uint64
+	diskNumBytes uint64
+	ramBytes     uint64 // the item's ram_bytes, not yet clamped
+	compression  uint8
+	inline       []byte // jobInline: the payload, aliasing the item
+}
+
+// readFileDataN reads and reassembles the full content of a regular file,
+// decoding up to workers compressed extents at once. Extent items are collected
+// via collectPrefixItems so files whose EXTENT_DATA items span multiple leaves
+// still read fully.
+//
+// The items are walked and checked serially (planFileRead); their data is then
+// read and decoded by inOrder: the compressed extents on the workers, the copy
+// into out in file order from this goroutine. The error returned is the first
+// in file order, whatever the workers' speeds.
+func readFileDataN(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint64, in *inodeItem, workers int) ([]byte, error) {
 	if in.size == 0 {
 		return []byte{}, nil
 	}
@@ -53,8 +89,23 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint6
 	if err != nil {
 		return nil, fmt.Errorf("btrfs: inode %d declared size %d: %w", in.num, in.size, err)
 	}
-	outLen := len(out)
+	jobs := planFileRead(items, in, len(out))
+
+	work := func(k int) ([]byte, error) { return jobs[k].decode(r, partOff, sb, dev, in.num) }
+	emit := func(k int, data []byte) error { return jobs[k].place(out, data, r, partOff, sb, in.num) }
+	if err := inOrder(len(jobs), workers, work, emit); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// planFileRead turns the EXTENT_DATA items of a file into jobs, in file order.
+// It stops at the first item that cannot be read, which becomes a jobFail: the
+// jobs before it still run, so the error reported is the one the serial walk
+// meets first.
+func planFileRead(items []prefixMatch, in *inodeItem, outLen int) []readJob {
 	le := binary.LittleEndian
+	var jobs []readJob
 
 	// prevEnd is where the previous regular extent's file range ended. The
 	// kernel refuses a leaf in which "file extent end range goes beyond start
@@ -80,29 +131,15 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint6
 			continue
 		}
 		compression := d[extDataOffCompression]
-		extType := d[extDataOffType]
-		switch extType {
+		switch d[extDataOffType] {
 		case extentDataInline:
-			// Inline: data immediately follows the header.
-			rawInline := d[extDataHdrSize:]
-			// H4: clamp the attacker's ram_bytes to a hard ceiling and to the
-			// remaining file bytes before using it as a decompression bound.
-			ramBytes := clampRAM(le.Uint64(d[extDataOffRamBytes:]), remaining)
-			inlineData, err := decompressExtent(rawInline, compression, ramBytes)
-			if err != nil {
-				return nil, fmt.Errorf("btrfs: inode %d inline extent at file offset %d: %w",
-					in.num, fileOffset, err)
-			}
-			n := uint64(len(inlineData))
-			if n > remaining {
-				n = remaining
-			}
-			// Bounds-check the destination slice (overflow-safe) before copy.
-			dst, err := safeio.Slice(out, int(fileOffset), int(n))
-			if err != nil {
-				return nil, fmt.Errorf("btrfs: inode %d inline extent dest [%d,+%d): %w", in.num, fileOffset, n, err)
-			}
-			copy(dst, inlineData[:n])
+			jobs = append(jobs, readJob{
+				kind: jobInline, fileOffset: fileOffset, remaining: remaining,
+				compression: compression, inline: d[extDataHdrSize:],
+				// H4: clamp the attacker's ram_bytes to a hard ceiling and to the
+				// remaining file bytes before using it as a decompression bound.
+				ramBytes: clampRAM(le.Uint64(d[extDataOffRamBytes:]), remaining),
+			})
 
 		case extentDataRegular:
 			if len(d) < extDataRegularSize {
@@ -110,8 +147,8 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint6
 			}
 			end := fileOffset + le.Uint64(d[extDataOffNumBytes:])
 			if end < fileOffset || fileOffset < prevEnd {
-				return nil, fmt.Errorf("btrfs: inode %d extent at file offset %d overlaps the previous extent (ends at %d): %w",
-					in.num, fileOffset, prevEnd, safeio.ErrOutOfBounds)
+				return append(jobs, readJob{kind: jobFail, err: fmt.Errorf("btrfs: inode %d extent at file offset %d overlaps the previous extent (ends at %d): %w",
+					in.num, fileOffset, prevEnd, safeio.ErrOutOfBounds)})
 			}
 			prevEnd = end
 			diskBytenr := le.Uint64(d[extDataOffDiskBytenr:])
@@ -119,63 +156,101 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint6
 				// Sparse extent — already zero.
 				continue
 			}
-			diskNumBytes := le.Uint64(d[extDataOffDiskNumBytes:])
-			extOffset := le.Uint64(d[extDataOffOffset:])
 			numBytes := le.Uint64(d[extDataOffNumBytes:])
 			if numBytes > remaining {
 				numBytes = remaining
 			}
 			// Overflow-safe destination bounds [fileOffset, fileOffset+numBytes).
 			if err := safeio.CheckBounds(int(fileOffset), int(numBytes), outLen); err != nil {
-				return nil, fmt.Errorf("btrfs: inode %d extent dest [%d,+%d): %w", in.num, fileOffset, numBytes, err)
+				return append(jobs, readJob{kind: jobFail, err: fmt.Errorf("btrfs: inode %d extent dest [%d,+%d): %w", in.num, fileOffset, numBytes, err)})
 			}
-			if compression == compressionNone {
-				phys, err := sb.physAddr(partOff, diskBytenr+extOffset)
-				if err != nil {
-					return nil, fmt.Errorf("btrfs: inode %d extent at file offset %d: %w",
-						in.num, fileOffset, err)
-				}
-				if _, err := r.ReadAt(out[fileOffset:fileOffset+numBytes], phys); err != nil {
-					return nil, fmt.Errorf("btrfs: read extent data: %w", err)
-				}
-				continue
+			j := readJob{
+				kind: jobRaw, fileOffset: fileOffset, remaining: remaining, numBytes: numBytes,
+				extOffset: le.Uint64(d[extDataOffOffset:]), diskBytenr: diskBytenr,
+				diskNumBytes: le.Uint64(d[extDataOffDiskNumBytes:]), compression: compression,
 			}
-			// Compressed extent: read the on-disk compressed payload at
-			// diskBytenr (size = diskNumBytes), decompress to the full
-			// ram_bytes, then copy [extOffset, extOffset+numBytes) into out.
-			// H3: diskNumBytes is attacker-controlled; bound the read buffer
-			// against the device size.
-			compressed, err := safeio.MakeBytes(int64(diskNumBytes), dev)
-			if err != nil {
-				return nil, fmt.Errorf("btrfs: inode %d compressed extent disk_num_bytes %d: %w", in.num, diskNumBytes, err)
+			if compression != compressionNone {
+				j.kind = jobCompressed
+				// H4: clamp ram_bytes to (extOffset+numBytes) and to the hard
+				// ceiling so a huge declared ram_bytes can't drive a giant alloc.
+				j.ramBytes = clampRAM(le.Uint64(d[extDataOffRamBytes:]), j.extOffset+numBytes)
 			}
-			phys, err := sb.physAddr(partOff, diskBytenr)
-			if err != nil {
-				return nil, fmt.Errorf("btrfs: inode %d extent at file offset %d: %w",
-					in.num, fileOffset, err)
-			}
-			if _, err := r.ReadAt(compressed, phys); err != nil {
-				return nil, fmt.Errorf("btrfs: read compressed extent data: %w", err)
-			}
-			// H4: clamp ram_bytes to (extOffset+numBytes) and to the hard
-			// ceiling so a huge declared ram_bytes can't drive a giant alloc.
-			ramBytes := clampRAM(le.Uint64(d[extDataOffRamBytes:]), extOffset+numBytes)
-			decompressed, err := decompressExtent(compressed, compression, ramBytes)
-			if err != nil {
-				return nil, fmt.Errorf("btrfs: inode %d extent at file offset %d: %w",
-					in.num, fileOffset, err)
-			}
-			// Validate the source window [extOffset, extOffset+numBytes) within
-			// the decompressed buffer (overflow-safe) before slicing.
-			if err := safeio.CheckBounds(int(extOffset), int(numBytes), len(decompressed)); err != nil {
-				return nil, fmt.Errorf("btrfs: decompressed extent too short for inode %d at file offset %d: %w",
-					in.num, fileOffset, err)
-			}
-			copy(out[fileOffset:fileOffset+numBytes], decompressed[extOffset:extOffset+numBytes])
+			jobs = append(jobs, j)
 			// extentDataPrealloc: treat as zero/sparse.
 		}
 	}
-	return out, nil
+	return jobs
+}
+
+// decode is the part of a job that runs on a worker: it touches no shared
+// state but the device (ReadAt). It returns the bytes to place, nil for a raw
+// extent (read by place).
+func (j *readJob) decode(r io.ReaderAt, partOff int64, sb *superblock, dev int64, ino uint64) ([]byte, error) {
+	switch j.kind {
+	case jobFail:
+		return nil, j.err
+	case jobInline:
+		data, err := decompressExtent(j.inline, j.compression, j.ramBytes)
+		if err != nil {
+			return nil, fmt.Errorf("btrfs: inode %d inline extent at file offset %d: %w", ino, j.fileOffset, err)
+		}
+		return data, nil
+	case jobCompressed:
+		// Read the on-disk compressed payload at diskBytenr (size =
+		// diskNumBytes), decompress to the full ram_bytes; place copies
+		// [extOffset, extOffset+numBytes) into out.
+		// H3: diskNumBytes is attacker-controlled; bound the read buffer
+		// against the device size.
+		compressed, release, err := getCompressed(j.diskNumBytes, dev)
+		if err != nil {
+			return nil, fmt.Errorf("btrfs: inode %d compressed extent disk_num_bytes %d: %w", ino, j.diskNumBytes, err)
+		}
+		defer release()
+		phys, err := sb.physAddr(partOff, j.diskBytenr)
+		if err != nil {
+			return nil, fmt.Errorf("btrfs: inode %d extent at file offset %d: %w", ino, j.fileOffset, err)
+		}
+		if _, err := r.ReadAt(compressed, phys); err != nil {
+			return nil, fmt.Errorf("btrfs: read compressed extent data: %w", err)
+		}
+		decompressed, err := decompressExtent(compressed, j.compression, j.ramBytes)
+		if err != nil {
+			return nil, fmt.Errorf("btrfs: inode %d extent at file offset %d: %w", ino, j.fileOffset, err)
+		}
+		// Validate the source window [extOffset, extOffset+numBytes) within
+		// the decompressed buffer (overflow-safe) before slicing.
+		if err := safeio.CheckBounds(int(j.extOffset), int(j.numBytes), len(decompressed)); err != nil {
+			return nil, fmt.Errorf("btrfs: decompressed extent too short for inode %d at file offset %d: %w", ino, j.fileOffset, err)
+		}
+		return decompressed[j.extOffset : j.extOffset+j.numBytes], nil
+	}
+	return nil, nil
+}
+
+// place is the part of a job that runs in file order on the caller: it copies
+// the decoded bytes into out, or reads an uncompressed extent straight into it.
+func (j *readJob) place(out, data []byte, r io.ReaderAt, partOff int64, sb *superblock, ino uint64) error {
+	switch j.kind {
+	case jobInline:
+		n := umin(uint64(len(data)), j.remaining)
+		// Bounds-check the destination slice (overflow-safe) before copy.
+		dst, err := safeio.Slice(out, int(j.fileOffset), int(n))
+		if err != nil {
+			return fmt.Errorf("btrfs: inode %d inline extent dest [%d,+%d): %w", ino, j.fileOffset, n, err)
+		}
+		copy(dst, data[:n])
+	case jobCompressed:
+		copy(out[j.fileOffset:j.fileOffset+j.numBytes], data)
+	case jobRaw:
+		phys, err := sb.physAddr(partOff, j.diskBytenr+j.extOffset)
+		if err != nil {
+			return fmt.Errorf("btrfs: inode %d extent at file offset %d: %w", ino, j.fileOffset, err)
+		}
+		if _, err := r.ReadAt(out[j.fileOffset:j.fileOffset+j.numBytes], phys); err != nil {
+			return fmt.Errorf("btrfs: read extent data: %w", err)
+		}
+	}
+	return nil
 }
 
 // clampRAM bounds an attacker-controlled ram_bytes value to a hard ceiling

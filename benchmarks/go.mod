@@ -12,6 +12,7 @@ require (
 
 require (
 	github.com/go-compressions/lzo v0.4.1 // indirect
+	github.com/go-filesystems/inflight v0.5.0 // indirect
 	github.com/go-volumes/gpt v0.3.0 // indirect
 	github.com/go-volumes/safeio v0.0.0-20261011024942-5635ea21db3b // indirect
 	github.com/klauspost/compress v1.20.3 // indirect

@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	filesystem "github.com/go-filesystems/interface"
@@ -71,6 +72,10 @@ type btrfsFS struct {
 	// invalidateCache() before any mutating operation returns, because a
 	// write (COW) changes the tree and may recycle logical addresses.
 	cache *cachedReader
+
+	// workers is how many compressed extents of one read are decoded at once
+	// (SetReadParallelism); 0 means the default, min(GOMAXPROCS, 8).
+	workers atomic.Int32
 }
 
 // osFileRWA adapts *os.File to readerWriterAt.
@@ -248,7 +253,7 @@ func (fs *btrfsFS) ReadFile(path string) ([]byte, error) {
 	if !in.isRegular() {
 		return nil, fmt.Errorf("btrfs: %q is not a regular file", path)
 	}
-	return readFileData(r, fs.partOffset, fs.sb, fs.fsTreeRoot, in)
+	return readFileDataN(r, fs.partOffset, fs.sb, fs.fsTreeRoot, in, fs.readWorkers())
 }
 
 // ListDir returns the directory entries of the directory at path.

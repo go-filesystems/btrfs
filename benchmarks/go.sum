@@ -1,9 +1,11 @@
 github.com/go-compressions/lzo v0.4.1 h1:lmyfO9eSvTZ7raEMHBMb39WUs7bmYKZE5BpfOQkwAWM=
 github.com/go-compressions/lzo v0.4.1/go.mod h1:dJtx0L0j59FkTKSVa5mu6JEXAeOKi9t9Z89SccSM2A4=
+github.com/go-filesystems/inflight v0.5.0 h1:JmkGgkT8/DKGLivRxUJkQUJAkOa8TLyB5W3LGIS0fxs=
+github.com/go-filesystems/inflight v0.5.0/go.mod h1:RA1/w2Hbza3HvTw+ZfABSw8lh6zmixEUPsulzbeaarA=
 github.com/go-filesystems/interface v0.6.0 h1:+7nA5FHgs/B03rZ9p81bkm0+6ew9fEntTFK8L5Uu6pk=
 github.com/go-filesystems/interface v0.6.0/go.mod h1:u9v8mvapNV8djzObwCECdyd2g6JBU6HNTR4EAqxOn6U=
-github.com/go-filesystems/kerneljudge v0.3.1 h1:XEzYYvR1V8PYfZ5BwR8YJjvkvaYgOHacxf2pdIb1Ggk=
-github.com/go-filesystems/kerneljudge v0.3.1/go.mod h1:SK6ri2WMRBATCd+RUhsOn+gLCy+F41a1VGebjQECZgs=
+github.com/go-filesystems/kerneljudge v0.4.0 h1:XQE80TkRErFQv2xu+A8oXeQNeTd63TLgeP9lN0oAonc=
+github.com/go-filesystems/kerneljudge v0.4.0/go.mod h1:SK6ri2WMRBATCd+RUhsOn+gLCy+F41a1VGebjQECZgs=
 github.com/go-volumes/gpt v0.3.0 h1:ZA33VVlmlkA47fFY+BkFylsufqq1TBoASIuBmri+xsw=
 github.com/go-volumes/gpt v0.3.0/go.mod h1:Dha6JL5/mGyDai8tWvZOPYn6pqe75NOtMRYGm3N4Qv8=
 github.com/go-volumes/safeio v0.0.0-20261011024942-5635ea21db3b h1:t1KQDKjOZ8ID/lZu0afPACvb5drgOpcHp1ATJS0do/A=

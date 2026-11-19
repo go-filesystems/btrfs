@@ -114,6 +114,11 @@ func (f *btrfsFile) fill(dst []byte, off uint64) error {
 	hi := off + uint64(len(dst))
 	le := binary.LittleEndian
 	dev := deviceSize(r)
+	// The extents that overlap the window become jobs, in file order; the
+	// compressed ones are read and decoded on the workers (parread.go), the
+	// copies into dst happen in file order from here, and the error returned is
+	// the first in file order.
+	var jobs []readJob
 	for _, m := range f.items {
 		fileOffset := m.k.offset
 		if fileOffset >= hi { // items are in file order
@@ -130,13 +135,11 @@ func (f *btrfsFile) fill(dst []byte, off uint64) error {
 		compression := d[extDataOffCompression]
 		switch d[extDataOffType] {
 		case extentDataInline:
-			ramBytes := clampRAM(le.Uint64(d[extDataOffRamBytes:]), remaining)
-			inline, err := decompressExtent(d[extDataHdrSize:], compression, ramBytes)
-			if err != nil {
-				return fmt.Errorf("btrfs: inode %d inline extent at file offset %d: %w", f.num, fileOffset, err)
-			}
-			n := umin(uint64(len(inline)), remaining)
-			copyWindow(dst, off, fileOffset, inline[:n])
+			jobs = append(jobs, readJob{
+				kind: jobInline, fileOffset: fileOffset, remaining: remaining,
+				compression: compression, inline: d[extDataHdrSize:],
+				ramBytes: clampRAM(le.Uint64(d[extDataOffRamBytes:]), remaining),
+			})
 
 		case extentDataRegular:
 			if len(d) < extDataRegularSize {
@@ -151,44 +154,42 @@ func (f *btrfsFile) fill(dst []byte, off uint64) error {
 				continue // sparse: already zero
 			}
 			extOffset := le.Uint64(d[extDataOffOffset:])
-			lo, top := umax(fileOffset, off), umin(fileOffset+numBytes, hi)
-			if compression == compressionNone {
-				phys, err := sb.physAddr(partOff, diskBytenr+extOffset+(lo-fileOffset))
-				if err != nil {
-					return fmt.Errorf("btrfs: inode %d extent at file offset %d: %w", f.num, fileOffset, err)
-				}
-				if _, err := r.ReadAt(dst[lo-off:top-off], phys); err != nil {
-					return fmt.Errorf("btrfs: read extent data: %w", err)
-				}
-				continue
+			j := readJob{
+				kind: jobRaw, fileOffset: fileOffset, remaining: remaining, numBytes: numBytes,
+				extOffset: extOffset, diskBytenr: diskBytenr,
+				diskNumBytes: le.Uint64(d[extDataOffDiskNumBytes:]), compression: compression,
 			}
-			// A compressed extent is read and decompressed whole (at most
-			// ram_bytes, 128 KiB for the kernel's writer), and the window is copied
-			// out of it.
-			diskNumBytes := le.Uint64(d[extDataOffDiskNumBytes:])
-			compressed, err := safeio.MakeBytes(int64(diskNumBytes), dev)
-			if err != nil {
-				return fmt.Errorf("btrfs: inode %d compressed extent disk_num_bytes %d: %w", f.num, diskNumBytes, err)
+			if compression != compressionNone {
+				// A compressed extent is read and decompressed whole (at most
+				// ram_bytes, 128 KiB for the kernel's writer), and the window is
+				// copied out of it.
+				j.kind = jobCompressed
+				j.ramBytes = clampRAM(le.Uint64(d[extDataOffRamBytes:]), extOffset+numBytes)
 			}
-			phys, err := sb.physAddr(partOff, diskBytenr)
-			if err != nil {
-				return fmt.Errorf("btrfs: inode %d extent at file offset %d: %w", f.num, fileOffset, err)
-			}
-			if _, err := r.ReadAt(compressed, phys); err != nil {
-				return fmt.Errorf("btrfs: read compressed extent data: %w", err)
-			}
-			ramBytes := clampRAM(le.Uint64(d[extDataOffRamBytes:]), extOffset+numBytes)
-			plain, err := decompressExtent(compressed, compression, ramBytes)
-			if err != nil {
-				return fmt.Errorf("btrfs: inode %d extent at file offset %d: %w", f.num, fileOffset, err)
-			}
-			if err := safeio.CheckBounds(int(extOffset), int(numBytes), len(plain)); err != nil {
-				return fmt.Errorf("btrfs: decompressed extent too short for inode %d at file offset %d: %w", f.num, fileOffset, err)
-			}
-			copyWindow(dst, off, fileOffset, plain[extOffset:extOffset+numBytes])
+			jobs = append(jobs, j)
 		}
 	}
-	return nil
+	work := func(k int) ([]byte, error) { return jobs[k].decode(r, partOff, sb, dev, f.num) }
+	emit := func(k int, data []byte) error {
+		j := &jobs[k]
+		switch j.kind {
+		case jobInline:
+			copyWindow(dst, off, j.fileOffset, data[:umin(uint64(len(data)), j.remaining)])
+		case jobCompressed:
+			copyWindow(dst, off, j.fileOffset, data)
+		case jobRaw:
+			lo, top := umax(j.fileOffset, off), umin(j.fileOffset+j.numBytes, hi)
+			phys, err := sb.physAddr(partOff, j.diskBytenr+j.extOffset+(lo-j.fileOffset))
+			if err != nil {
+				return fmt.Errorf("btrfs: inode %d extent at file offset %d: %w", f.num, j.fileOffset, err)
+			}
+			if _, err := r.ReadAt(dst[lo-off:top-off], phys); err != nil {
+				return fmt.Errorf("btrfs: read extent data: %w", err)
+			}
+		}
+		return nil
+	}
+	return inOrder(len(jobs), f.fs.readWorkers(), work, emit)
 }
 
 // The package has its own min and max (of ints); these are the uint64 ones.

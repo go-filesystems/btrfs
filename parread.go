@@ -16,13 +16,95 @@ package filesystem_btrfs
 // With one worker (or one job) nothing is spawned: the path is the serial loop.
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
+	"io"
 	"runtime"
 	"sync"
 
 	"github.com/go-filesystems/inflight"
 	"github.com/go-volumes/safeio"
+	"github.com/klauspost/compress/zstd"
 )
+
+// Decoders are pooled: a zstd decoder or a zlib reader allocates its window and
+// tables on every NewReader, which with several workers costs more in the
+// allocator and the GC than the pooling costs in code. Reset starts a new
+// stream on a pooled one; a pooled decoder holds no reference to its input
+// (Reset(nil) / an empty reader) and an error leaves it reusable after Reset.
+
+var zstdPool sync.Pool // *zstd.Decoder
+
+func getZstdReader(src []byte) (*zstd.Decoder, error) {
+	if v := zstdPool.Get(); v != nil {
+		zr := v.(*zstd.Decoder)
+		if err := zr.Reset(bytes.NewReader(src)); err == nil {
+			return zr, nil
+		}
+		zr.Close()
+	}
+	return zstd.NewReader(bytes.NewReader(src),
+		zstd.WithDecoderMaxWindow(zstdMaxWindow),
+		zstd.WithDecoderMaxMemory(zstdMaxWindow),
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderLowmem(true))
+}
+
+func putZstdReader(zr *zstd.Decoder) {
+	if zr.Reset(nil) != nil {
+		zr.Close()
+		return
+	}
+	zstdPool.Put(zr)
+}
+
+var zlibPool sync.Pool // io.ReadCloser that is a zlib.Resetter
+
+func getZlibReader(src []byte) (io.ReadCloser, error) {
+	if v := zlibPool.Get(); v != nil {
+		zr := v.(io.ReadCloser)
+		if err := zr.(zlib.Resetter).Reset(bytes.NewReader(src), nil); err == nil {
+			return zr, nil
+		}
+	}
+	return zlib.NewReader(bytes.NewReader(src))
+}
+
+func putZlibReader(zr io.ReadCloser) {
+	zr.Close()
+	zlibPool.Put(zr)
+}
+
+// readAllLimit reads r to its end or until limit bytes, whichever is first. The
+// buffer is sized from limit (at most the 128 KiB a btrfs extent can decode to)
+// so the common case allocates once, instead of ReadAll's doubling from 512
+// bytes. A read that reaches limit stops there without probing for EOF.
+func readAllLimit(r io.Reader, limit int64) ([]byte, error) {
+	hint := int64(maxDecompressRAM) + 1
+	if limit < hint {
+		hint = limit
+	}
+	b := make([]byte, 0, max(int(hint), 0))
+	for int64(len(b)) < limit {
+		if len(b) == cap(b) {
+			b = append(b, 0)[:len(b)]
+		}
+		end := cap(b)
+		if rem := limit - int64(len(b)); rem < int64(end-len(b)) {
+			end = len(b) + int(rem)
+		}
+		n, err := r.Read(b[len(b):end])
+		b = b[:len(b)+n]
+		if err == io.EOF {
+			return b, nil
+		}
+		if err != nil {
+			return b, err
+		}
+	}
+	return b, nil
+}
 
 // maxReadParallelism caps the default worker count: past it the decoders are
 // memory-bound and the extra goroutines buy nothing.

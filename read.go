@@ -1,14 +1,11 @@
 package filesystem_btrfs
 
 import (
-	"bytes"
-	"compress/zlib"
 	"encoding/binary"
 	"fmt"
 	"io"
 
 	"github.com/go-volumes/safeio"
-	"github.com/klauspost/compress/zstd"
 )
 
 // EXTENT_DATA item layout (btrfs_file_extent_item):
@@ -287,15 +284,15 @@ func decompressExtent(src []byte, compression uint8, ramBytes uint64) ([]byte, e
 	case compressionNone:
 		return src, nil
 	case compressionZlib:
-		zr, err := zlib.NewReader(bytes.NewReader(src))
+		zr, err := getZlibReader(src)
 		if err != nil {
 			return nil, fmt.Errorf("zlib reader: %w", err)
 		}
-		defer zr.Close()
+		defer putZlibReader(zr)
 		// Cap reads at ramBytes + a small slack so a malformed stream cannot
 		// allocate unbounded memory. ramBytes is clamped to the hard ceiling
 		// so a huge or overflowing declared size can't defeat the limit.
-		out, err := io.ReadAll(io.LimitReader(zr, decompressLimit(ramBytes)))
+		out, err := readAllLimit(zr, decompressLimit(ramBytes))
 		if err != nil {
 			return nil, fmt.Errorf("zlib decompress: %w", err)
 		}
@@ -314,15 +311,11 @@ func decompressExtent(src []byte, compression uint8, ramBytes uint64) ([]byte, e
 // by the kernel; ramBytes caps the output to defend against malformed
 // input.
 func decompressZstd(src []byte, ramBytes uint64) ([]byte, error) {
-	zr, err := zstd.NewReader(bytes.NewReader(src),
-		zstd.WithDecoderMaxWindow(zstdMaxWindow),
-		zstd.WithDecoderMaxMemory(zstdMaxWindow),
-		zstd.WithDecoderConcurrency(1),
-		zstd.WithDecoderLowmem(true))
+	zr, err := getZstdReader(src)
 	if err != nil {
 		return nil, fmt.Errorf("zstd reader: %w", err)
 	}
-	defer zr.Close()
+	defer putZstdReader(zr)
 	// A kernel zstd extent is ONE frame followed by zero padding to the sector
 	// size (Linux v6.17 fs/btrfs/zstd.c, zstd_decompress_bio, lines 630-640:
 	// it leaves its loop once the output is complete or at the end of the
@@ -336,7 +329,7 @@ func decompressZstd(src []byte, ramBytes uint64) ([]byte, error) {
 	if ramBytes > maxDecompressRAM {
 		ramBytes = maxDecompressRAM
 	}
-	out, err := io.ReadAll(io.LimitReader(zr, int64(ramBytes)))
+	out, err := readAllLimit(zr, int64(ramBytes))
 	if err != nil {
 		return nil, fmt.Errorf("zstd decompress: %w", err)
 	}

@@ -17,7 +17,6 @@ package filesystem_btrfs
 
 import (
 	"bytes"
-	"compress/zlib"
 	"context"
 	"io"
 	"runtime"
@@ -25,6 +24,7 @@ import (
 
 	"github.com/go-filesystems/inflight"
 	"github.com/go-volumes/safeio"
+	"github.com/klauspost/compress/zlib"
 	"github.com/klauspost/compress/zstd"
 )
 

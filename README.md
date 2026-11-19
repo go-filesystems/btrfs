@@ -60,6 +60,32 @@ Against the kernel on one image (4000 small files, a 256 MiB file): metadata wal
 10369 files/s against 82447 for the kernel; the sequential read figure is not a
 storage comparison (host-cached VM disk), see the kerneljudge README.
 
+## Parallel reads of compressed extents
+
+`ReadFile` and `OpenFile`'s `ReadAt` read and decode the compressed extents of a
+file (zlib, LZO, zstd) on up to `min(GOMAXPROCS, 8)` goroutines
+(`inflight.Ordered`: bounded to that many decoded extents in memory, delivered in
+file order; `SetReadParallelism(n)` on the filesystem, 1 = serial and nothing is
+spawned). The EXTENT_DATA items are still walked and checked serially, and the
+error returned is the first in file order whatever the workers' speeds. The zstd
+and zlib decoders are pooled.
+
+Sequential read of a 256 MiB text-like file the kernel (6.17) wrote with
+`compress-force`, MiB/s, kernel against this driver in the same VM, medians of 5
+interleaved rounds in a calibrated uniform regime (`kerneljudge` v0.4.0,
+`compressedread_perf_test.go`; the ~650-700 Mops/s and ~2600 Mops/s regimes are
+1 and 4 CPUs):
+
+| codec | 1 CPU kernel | 1 CPU v0.5.6 | 1 CPU now | 4 CPUs kernel | 4 CPUs v0.5.6 | 4 CPUs now |
+|---|---:|---:|---:|---:|---:|---:|
+| lzo  | 1184 | 1340 | 1376 | 3313 | 1326 | 2536 |
+| zstd |  838 |  722 | 1175 | 2512 |  667 | 2290 |
+| zlib |  374 |  237 |  303 | 1226 |  236 |  924 |
+
+(Kernel figures are those of the v0.5.6 run; the run of the new code measured
+1169 / 809 / 360 at 1 CPU and 3317 / 2471 / 1233 at 4.) zlib at 1 CPU and LZO at
+4 CPUs are still behind the kernel.
+
 ## Untrusted input
 
 An image is attacker-controlled bytes. Every allocation, walk and recursion the

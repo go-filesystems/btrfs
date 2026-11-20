@@ -1,6 +1,6 @@
 module github.com/go-filesystems/btrfs
 
-go 1.27.1
+go 1.27.4
 
 require (
 	github.com/go-compressions/lzo v0.4.1

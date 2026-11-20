@@ -86,6 +86,13 @@ interleaved rounds in a calibrated uniform regime (`kerneljudge` v0.4.0,
 1169 / 809 / 360 at 1 CPU and 3317 / 2471 / 1233 at 4.) zlib at 1 CPU and LZO at
 4 CPUs are still behind the kernel.
 
+zlib extents are inflated as raw DEFLATE (klauspost/compress) and their Adler-32
+is checked with go-simd/adler32 (NEON, AVX2, AVX-512): the scalar sum was about
+14 % of a 128 KiB extent's decode time. Against the kernel in the same run, zlib
+reads go from 0.88 to 0.91 of its speed at 1 CPU (285 / 324 to 325 / 357 MiB/s)
+and from 0.70 to 0.78 at 4 CPUs (824 / 1179 to 939 / 1212); inflate itself is
+still the cost, so zlib stays behind the kernel.
+
 ## Untrusted input
 
 An image is attacker-controlled bytes. Every allocation, walk and recursion the

@@ -93,6 +93,11 @@ reads go from 0.88 to 0.91 of its speed at 1 CPU (285 / 324 to 325 / 357 MiB/s)
 and from 0.70 to 0.78 at 4 CPUs (824 / 1179 to 939 / 1212); inflate itself is
 still the cost, so zlib stays behind the kernel.
 
+Fully covered LZO extents decode straight into the output buffer, with no
+allocation per extent (one 128 KiB allocation and copy before); this gives no
+throughput gain at 4 CPUs (2322 to 2330 MiB/s, inside the run-to-run spread), so
+lzo at 4 CPUs stays behind the kernel.
+
 ## Untrusted input
 
 An image is attacker-controlled bytes. Every allocation, walk and recursion the

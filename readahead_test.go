@@ -72,3 +72,36 @@ func TestReadAheadFillsWindow(t *testing.T) {
 		t.Fatal("one worker must not read ahead")
 	}
 }
+
+// A read inside the window is served from it (a sentinel planted in the window
+// shows up), a read that starts before it, or ends after it, is not.
+func TestReadAheadServesFromTheWindowOnly(t *testing.T) {
+	bf, want, _ := buildParallelFile(t, 37)
+	bf.SetReadParallelism(4)
+	f, _ := bf.OpenFile("/par.bin")
+	bt := f.(*btrfsFile)
+	buf := make([]byte, extPlain)
+	f.ReadAt(buf, 0)
+	f.ReadAt(buf, extPlain)
+	if bt.ra == nil {
+		t.Fatal("no window")
+	}
+	bt.ra[10] = ^bt.ra[10] // plant a sentinel at file offset raOff+10
+	b := make([]byte, 4)
+	f.ReadAt(b, int64(bt.raOff)+9)
+	if b[1] == want[int(bt.raOff)+10] {
+		t.Fatal("a read inside the window was not served from it")
+	}
+	f.ReadAt(b, int64(bt.raOff)-2) // starts before the window: plain path
+	if !bytes.Equal(b, want[int(bt.raOff)-2:int(bt.raOff)+2]) {
+		t.Fatal("a read starting before the window was served from it")
+	}
+	bt.ra = bt.ra[:100] // a window that ends early: a read past its end is not served from it
+	bt.ra[10] = ^bt.ra[10]
+	bt.seqEnd = 0
+	c := make([]byte, 200)
+	f.ReadAt(c, int64(bt.raOff))
+	if !bytes.Equal(c, want[bt.raOff:bt.raOff+200]) {
+		t.Fatal("a read ending past the window was served from it")
+	}
+}

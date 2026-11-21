@@ -70,6 +70,13 @@ spawned). The EXTENT_DATA items are still walked and checked serially, and the
 error returned is the first in file order whatever the workers' speeds. The zstd
 and zlib decoders are pooled.
 
+A `ReadAt` of 1 MiB holds only 8 extents of 128 KiB, so decoding each call alone
+fills the workers and drains them again. A read that continues the previous one,
+on a file with compressed extents and more than one worker, therefore decodes
+16 MiB at once (about 16 MiB of memory per open file) and serves the next calls
+from that window. LZO at 4 CPUs went from 2377 to 3509 MiB/s, 0.78 to 1.05 of the
+kernel in the same run (v0.6.2 against this change, `kerneljudge` v0.4.0).
+
 Sequential read of a 256 MiB text-like file the kernel (6.17) wrote with
 `compress-force`, MiB/s, kernel against this driver in the same VM, medians of 5
 interleaved rounds in a calibrated uniform regime (`kerneljudge` v0.4.0,

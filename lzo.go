@@ -2,6 +2,7 @@ package filesystem_btrfs
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"github.com/go-compressions/lzo"
@@ -62,6 +63,66 @@ func decompressLzo(src []byte, ramBytes uint64) ([]byte, error) {
 	out := make([]byte, 0, limit)
 	segOut := make([]byte, btrfsLzoPageSize)
 
+	err := lzoSegments(src, func(off int, blk []byte) error {
+		// Each segment expands to at most one page: one buffer of that
+		// size serves every segment, the decoder returns the length.
+		n, err := lzo.DecodeBlock(segOut, blk)
+		if err != nil {
+			return fmt.Errorf("lzo: segment at offset %d: %w", off, err)
+		}
+		if uint64(len(out)+n) > limit {
+			return fmt.Errorf("lzo: decompressed size exceeds ram_bytes %d", ramBytes)
+		}
+		out = append(out, segOut[:n]...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// decompressLzoInto decodes a btrfs-framed LZO extent straight into dst, whose
+// length is the exact decoded size the caller expects: no intermediate buffer,
+// no copy. Each segment is decoded into the next page-sized window of dst, so
+// the decoder's scratch writes stay inside dst and inside the segments still
+// to come. A stream that yields more or fewer bytes than len(dst) is refused.
+func decompressLzoInto(dst, src []byte) error {
+	pos := 0
+	err := lzoSegments(src, func(off int, blk []byte) error {
+		win := dst[pos:]
+		if len(win) > btrfsLzoPageSize {
+			win = win[:btrfsLzoPageSize]
+		}
+		n, err := lzo.DecodeBlock(win, blk)
+		if err != nil {
+			if errors.Is(err, lzo.ErrShortDst) {
+				return fmt.Errorf("lzo: decompressed size exceeds %d bytes", len(dst))
+			}
+			return fmt.Errorf("lzo: segment at offset %d: %w", off, err)
+		}
+		pos += n
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if pos != len(dst) {
+		return fmt.Errorf("lzo: decompressed %d bytes, expected %d", pos, len(dst))
+	}
+	return nil
+}
+
+// lzoSegments walks the framing of a btrfs LZO extent and calls fn with each
+// non-empty segment's payload and the offset of its length header.
+func lzoSegments(src []byte, fn func(off int, blk []byte) error) error {
+	if len(src) < 4 {
+		return fmt.Errorf("lzo: extent too short (%d bytes) for header", len(src))
+	}
+	totalSize := binary.LittleEndian.Uint32(src[:4])
+	if int(totalSize) > len(src) || totalSize < 4 {
+		return fmt.Errorf("lzo: invalid total_size %d (buffer %d)", totalSize, len(src))
+	}
 	in := 4
 	end := int(totalSize)
 	for in < end {
@@ -74,7 +135,7 @@ func decompressLzo(src []byte, ramBytes uint64) ([]byte, error) {
 			}
 		}
 		if in+4 > end {
-			return nil, fmt.Errorf("lzo: truncated segment header at offset %d", in)
+			return fmt.Errorf("lzo: truncated segment header at offset %d", in)
 		}
 		segLen := binary.LittleEndian.Uint32(src[in : in+4])
 		in += 4
@@ -82,19 +143,12 @@ func decompressLzo(src []byte, ramBytes uint64) ([]byte, error) {
 			continue
 		}
 		if uint64(segLen) > uint64(end-in) {
-			return nil, fmt.Errorf("lzo: segment length %d exceeds remaining %d", segLen, end-in)
+			return fmt.Errorf("lzo: segment length %d exceeds remaining %d", segLen, end-in)
 		}
-		// Each segment expands to at most one page: one buffer of that
-		// size serves every segment, the decoder returns the length.
-		n, err := lzo.DecodeBlock(segOut, src[in:in+int(segLen)])
-		if err != nil {
-			return nil, fmt.Errorf("lzo: segment at offset %d: %w", in-4, err)
+		if err := fn(in-4, src[in:in+int(segLen)]); err != nil {
+			return err
 		}
-		if uint64(len(out)+n) > limit {
-			return nil, fmt.Errorf("lzo: decompressed size exceeds ram_bytes %d", ramBytes)
-		}
-		out = append(out, segOut[:n]...)
 		in += int(segLen)
 	}
-	return out, nil
+	return nil
 }

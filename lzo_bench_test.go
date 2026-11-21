@@ -1,6 +1,7 @@
 package filesystem_btrfs
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -43,6 +44,59 @@ func BenchmarkLzoExtent(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		if _, err := decompressLzo(src, 128<<10); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// TestLzoExtentInto: decoding straight into the caller's window gives the same
+// bytes as decompressLzo, never touches a byte outside the window (the decoder
+// scribbles past its output inside the slice it is given, so the window must
+// bound it), and refuses a window of the wrong size.
+func TestLzoExtentInto(t *testing.T) {
+	src, err := os.ReadFile("testdata/lzo-extent-128k.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := decompressLzo(src, 128<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const guard = 64
+	buf := make([]byte, guard+len(want)+guard)
+	for i := range buf {
+		buf[i] = 0xA5
+	}
+	win := buf[guard : guard+len(want) : guard+len(want)]
+	if err := decompressLzoInto(win, src); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(win, want) {
+		t.Fatal("window differs from decompressLzo")
+	}
+	for i := 0; i < guard; i++ {
+		if buf[i] != 0xA5 || buf[guard+len(want)+i] != 0xA5 {
+			t.Fatalf("byte outside the window overwritten at guard offset %d", i)
+		}
+	}
+	if err := decompressLzoInto(make([]byte, len(want)-1), src); err == nil {
+		t.Fatal("window one byte short: want an error")
+	}
+	if err := decompressLzoInto(make([]byte, len(want)+1), src); err == nil {
+		t.Fatal("window one byte long: want an error")
+	}
+}
+
+func BenchmarkLzoExtentInto(b *testing.B) {
+	src, err := os.ReadFile("testdata/lzo-extent-128k.bin")
+	if err != nil {
+		b.Fatal(err)
+	}
+	dst := make([]byte, 128<<10)
+	b.SetBytes(128 << 10)
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := decompressLzoInto(dst, src); err != nil {
 			b.Fatal(err)
 		}
 	}

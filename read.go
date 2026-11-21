@@ -57,6 +57,12 @@ type readJob struct {
 	ramBytes     uint64 // the item's ram_bytes, not yet clamped
 	compression  uint8
 	inline       []byte // jobInline: the payload, aliasing the item
+	// dst, when set on a jobCompressed LZO extent that starts at extOffset 0, is
+	// the file's own output window: decode writes the extent there and sets
+	// direct, so place has nothing left to copy. Extents never overlap (checked
+	// by the plan), so concurrent workers write disjoint windows.
+	dst    []byte
+	direct bool
 }
 
 // readFileDataN reads and reassembles the full content of a regular file,
@@ -88,7 +94,13 @@ func readFileDataN(r io.ReaderAt, partOff int64, sb *superblock, fsTreeRoot uint
 	}
 	jobs := planFileRead(items, in, len(out))
 
-	work := func(k int) ([]byte, error) { return jobs[k].decode(r, partOff, sb, dev, in.num) }
+	work := func(k int) ([]byte, error) {
+		j := &jobs[k]
+		if j.kind == jobCompressed && j.compression == compressionLzo && j.extOffset == 0 {
+			j.dst = out[j.fileOffset : j.fileOffset+j.numBytes : j.fileOffset+j.numBytes]
+		}
+		return j.decode(r, partOff, sb, dev, in.num)
+	}
 	emit := func(k int, data []byte) error { return jobs[k].place(out, data, r, partOff, sb, in.num) }
 	if err := inOrder(len(jobs), workers, work, emit); err != nil {
 		return nil, err
@@ -210,6 +222,13 @@ func (j *readJob) decode(r io.ReaderAt, partOff int64, sb *superblock, dev int64
 		if _, err := r.ReadAt(compressed, phys); err != nil {
 			return nil, fmt.Errorf("btrfs: read compressed extent data: %w", err)
 		}
+		if j.dst != nil {
+			if err := decompressLzoInto(j.dst, compressed); err != nil {
+				return nil, fmt.Errorf("btrfs: inode %d extent at file offset %d: %w", ino, j.fileOffset, err)
+			}
+			j.direct = true
+			return nil, nil
+		}
 		decompressed, err := decompressExtent(compressed, j.compression, j.ramBytes)
 		if err != nil {
 			return nil, fmt.Errorf("btrfs: inode %d extent at file offset %d: %w", ino, j.fileOffset, err)
@@ -237,7 +256,9 @@ func (j *readJob) place(out, data []byte, r io.ReaderAt, partOff int64, sb *supe
 		}
 		copy(dst, data[:n])
 	case jobCompressed:
-		copy(out[j.fileOffset:j.fileOffset+j.numBytes], data)
+		if !j.direct {
+			copy(out[j.fileOffset:j.fileOffset+j.numBytes], data)
+		}
 	case jobRaw:
 		phys, err := sb.physAddr(partOff, j.diskBytenr+j.extOffset)
 		if err != nil {

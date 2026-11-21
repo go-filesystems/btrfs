@@ -67,6 +67,9 @@ func openBtrfsFile(fs *btrfsFS, root uint64, path string) (filesystem.File, erro
 				in.num, m.k.offset, prevEnd, safeio.ErrOutOfBounds)
 		}
 		prevEnd = end
+		if d[extDataOffCompression] != compressionNone {
+			f.compressed = true
+		}
 	}
 	return f, nil
 }
@@ -76,7 +79,20 @@ type btrfsFile struct {
 	num   uint64
 	size  uint64
 	items []prefixMatch
+
+	// Read-ahead state, guarded by fs.mu (see fill). compressed is set at open.
+	compressed bool
+	seqEnd     uint64 // where the previous read ended
+	raOff      uint64 // file offset of ra[0]
+	ra         []byte // the decoded window read ahead, or nil
 }
+
+// readAheadBytes is the window a sequential read of a compressed file decodes
+// at once. A ReadAt of 1 MiB holds 8 extents of 128 KiB: decoded alone, each
+// call fills the workers and then drains them (head-of-line wait on the last
+// extents), which capped lzo at 4 CPUs at about 2600 MiB/s against 3800 for a
+// window of 16-64 MiB (btrfs#56).
+const readAheadBytes = 16 << 20
 
 func (f *btrfsFile) Size() int64 { return int64(f.size) }
 
@@ -106,9 +122,40 @@ func (f *btrfsFile) ReadAt(p []byte, off int64) (int, error) {
 	return int(want), nil
 }
 
+// fill reads the window. A read that continues the previous one, on a file with
+// compressed extents and with several workers, decodes readAheadBytes at once
+// into f.ra and serves this and the next reads from it.
 func (f *btrfsFile) fill(dst []byte, off uint64) error {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
+	end := off + uint64(len(dst))
+	if f.ra != nil && off >= f.raOff && end <= f.raOff+uint64(len(f.ra)) {
+		copy(dst, f.ra[off-f.raOff:end-f.raOff])
+		f.seqEnd = end
+		return nil
+	}
+	sequential := off != 0 && off == f.seqEnd
+	f.seqEnd = end
+	if sequential && f.compressed && f.fs.readWorkers() > 1 && len(dst) < readAheadBytes {
+		if n := umin(readAheadBytes, f.size-off); n > uint64(len(dst)) {
+			if uint64(cap(f.ra)) < n {
+				f.ra = make([]byte, n)
+			}
+			buf := f.ra[:n]
+			clear(buf)
+			f.ra = nil
+			if err := f.fillLocked(buf, off); err == nil {
+				f.ra, f.raOff = buf, off
+				copy(dst, buf)
+				return nil
+			}
+			// the plain path below reports the error for dst's own window
+		}
+	}
+	return f.fillLocked(dst, off)
+}
+
+func (f *btrfsFile) fillLocked(dst []byte, off uint64) error {
 	r := f.fs.reader()
 	sb, partOff := f.fs.sb, f.fs.partOffset
 	hi := off + uint64(len(dst))

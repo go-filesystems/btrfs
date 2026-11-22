@@ -185,7 +185,7 @@ func buildMultiLevelExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblo
 	for _, u := range final.bgUsed {
 		totalUsed += u
 	}
-	return updateSuperBytesUsed(rwaAt, partOff, totalUsed)
+	return updateSuperBytesUsed(rwaAt, partOff, sb, totalUsed)
 }
 
 // tryExtentLayout allocates `blockCount` node blocks (apportioned into leaves and
@@ -408,6 +408,9 @@ func repointExtentRoot(rwaAt readerWriterAt, partOff int64, sb *superblock, newR
 	leaf := make([]byte, sb.nodeSize)
 	if _, err := rwaAt.ReadAt(leaf, phys); err != nil {
 		return fmt.Errorf("read root tree leaf: %w", err)
+	}
+	if err := verifyTreeBlock(sb, leaf, phys, leafLog); err != nil {
+		return err
 	}
 	idx := findItemIdx(leaf, extentTreeObjID, typeRootItem, 0)
 	if idx < 0 {

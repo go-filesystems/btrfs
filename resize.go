@@ -343,6 +343,9 @@ func (fs *btrfsFS) rewriteChunkSizeLocked(logStart, newSize uint64) error {
 	if _, err := fs.rwa.ReadAt(leafBuf, phys); err != nil {
 		return fmt.Errorf("read chunk tree node: %w", err)
 	}
+	if err := verifyTreeBlock(fs.sb, leafBuf, phys, fs.sb.chunkLogAddr); err != nil {
+		return err
+	}
 	idx := findItemIdx(leafBuf, firstChunkTreeObjID, typeChunkItem, logStart)
 	if idx < 0 {
 		return fmt.Errorf("locate CHUNK_ITEM %d: not in chunk tree leaf", logStart)
@@ -504,6 +507,9 @@ func (fs *btrfsFS) rewriteSysChunkArrayEntryLocked(logStart, newSize uint64) err
 	if _, err := fs.rwa.ReadAt(buf, fs.partOffset+superblockOffset); err != nil {
 		return fmt.Errorf("read superblock: %w", err)
 	}
+	if err := verifySuperblockRMW(fs.sb, buf, fs.partOffset+superblockOffset); err != nil {
+		return err
+	}
 	le := binary.LittleEndian
 	arrSz := int(le.Uint32(buf[sbfSysChunkArrSz:]))
 	if arrSz <= 0 || sbfSysChunkArr+arrSz > len(buf) {
@@ -548,6 +554,9 @@ func (fs *btrfsFS) rewriteResizedSuperblockLocked(newTotalBytes uint64) error {
 	if _, err := fs.rwa.ReadAt(buf, fs.partOffset+superblockOffset); err != nil {
 		return fmt.Errorf("read superblock: %w", err)
 	}
+	if err := verifySuperblockRMW(fs.sb, buf, fs.partOffset+superblockOffset); err != nil {
+		return err
+	}
 	le := binary.LittleEndian
 
 	le.PutUint64(buf[sbfTotalBytes:], newTotalBytes)
@@ -589,6 +598,9 @@ func (fs *btrfsFS) rewriteChunkTreeDevItemLocked(totalBytes, bytesUsed uint64) e
 	leafBuf := make([]byte, fs.sb.nodeSize)
 	if _, err := fs.rwa.ReadAt(leafBuf, phys); err != nil {
 		return fmt.Errorf("read chunk tree node: %w", err)
+	}
+	if err := verifyTreeBlock(fs.sb, leafBuf, phys, fs.sb.chunkLogAddr); err != nil {
+		return err
 	}
 	if parseNodeHeader(leafBuf).level != 0 {
 		return nil

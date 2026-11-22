@@ -138,11 +138,27 @@ var _ FS = (*btrfsFS)(nil)
 // partition table (MBR/GPT) and selecting the first Linux partition.
 // Pass partIndex = -1 for auto-detection.
 func Open(imagePath string, partIndex int) (FS, error) {
+	return OpenWithOptions(imagePath, partIndex, OpenOptions{})
+}
+
+// OpenOptions tunes Open. The zero value is the safe default.
+type OpenOptions struct {
+	// IgnoreChecksums disables verification of the superblock and tree-block
+	// checksums (a forensic opt-out for reading a damaged or tampered image).
+	// Off by default: without it a checksum mismatch is a *ChecksumError.
+	// An unsupported csum_type (anything but crc32c) is refused regardless.
+	// Do not write to a filesystem opened this way: a write recomputes the
+	// checksums of the blocks it touches.
+	IgnoreChecksums bool
+}
+
+// OpenWithOptions is Open with explicit options.
+func OpenWithOptions(imagePath string, partIndex int, opts OpenOptions) (FS, error) {
 	f, err := os.OpenFile(imagePath, os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("btrfs: open %s: %w", imagePath, err)
 	}
-	return OpenFromDevice(&osFileBackend{f: f}, partIndex)
+	return OpenFromDevicesWithOptions([]BlockBackend{&osFileBackend{f: f}}, partIndex, opts)
 }
 
 // OpenFromDevice opens a Btrfs filesystem backed by an arbitrary
@@ -171,6 +187,13 @@ func OpenFromDevice(dev BlockBackend, partIndex int) (FS, error) {
 // callers are responsible for grouping legs that share the same fsid
 // (cloud-boot-init scans /sys/block for matching fsids).
 func OpenFromDevices(devs []BlockBackend, partIndex int) (FS, error) {
+	return OpenFromDevicesWithOptions(devs, partIndex, OpenOptions{})
+}
+
+// OpenFromDevicesWithOptions is OpenFromDevices with explicit options. The
+// superblock is verified (falling back to the 64 MiB / 256 GiB / 1 PiB copies
+// when the primary's checksum does not match) and so is every tree block read.
+func OpenFromDevicesWithOptions(devs []BlockBackend, partIndex int, opts OpenOptions) (FS, error) {
 	if len(devs) == 0 {
 		return nil, fmt.Errorf("btrfs: OpenFromDevices: empty device list")
 	}
@@ -181,7 +204,7 @@ func OpenFromDevices(devs []BlockBackend, partIndex int) (FS, error) {
 		return nil, err
 	}
 
-	sb, err := readSuperblock(primary, off)
+	sb, err := readSuperblockFallback(primary, off, opts.IgnoreChecksums)
 	if err != nil {
 		closeAll(devs)
 		return nil, err
@@ -194,7 +217,7 @@ func OpenFromDevices(devs []BlockBackend, partIndex int) (FS, error) {
 	// within its partition.
 	pool := newDevicePool(primary, off, sb)
 	for i, secondary := range devs[1:] {
-		ssb, serr := readSuperblock(secondary, off)
+		ssb, serr := readSuperblockFallback(secondary, off, opts.IgnoreChecksums)
 		if serr != nil {
 			pool.Close()
 			return nil, fmt.Errorf("btrfs: read superblock on device %d: %w", i+1, serr)

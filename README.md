@@ -10,6 +10,8 @@ Pure-Go read/write access to Btrfs filesystem images — no root privileges, no 
 
 Supports single-device Btrfs images with CRC32c metadata checksums (btrfs-progs ≥ 5.x). MBR/GPT partition tables are auto-detected.
 
+Metadata checksums are **verified on read** (since v0.7.0; earlier releases wrote them but never checked them): the superblock and every tree block read are checked against their crc32c, and a mismatch is a typed `*ChecksumError` (`errors.As`; `errors.Is(err, ErrChecksum)`), never served and never re-checksummed by a later write. A superblock whose checksum is wrong falls back to the mirrors at 64 MiB, 256 GiB and 1 PiB. A `csum_type` other than crc32c (xxhash64, sha256, blake2b) is refused with `*UnsupportedChecksumError`. `OpenWithOptions(path, part, OpenOptions{IgnoreChecksums: true})` is the explicit, off-by-default forensic opt-out for reading a damaged image. Format reference: [On-disk format](https://btrfs.readthedocs.io/en/latest/dev/On-disk-format.html).
+
 ## References
 
 https://btrfs.readthedocs.io/en/latest/
@@ -39,6 +41,7 @@ https://btrfs.readthedocs.io/en/latest/
 - Quotas and reflink are not implemented.
 - Multi-device/RAID *writes* are not implemented (reading multi-device pools is).
 - No online device add/remove or balance operations.
+- Only the crc32c checksum type is implemented; images using xxhash64, sha256 or blake2b are refused. Data (file content) checksums in the csum tree are not verified. On a checksum mismatch in a DUP/RAID1 chunk the other mirror is not tried yet.
 - Intended for testing and tooling; not recommended for production use.
 
 ## Judged by

@@ -700,6 +700,9 @@ func writeSuperblock(rwaAt readerWriterAt, partOff int64, sb *superblock, newFsR
 	if _, err := rwaAt.ReadAt(buf, partOff+superblockOffset); err != nil {
 		return fmt.Errorf("btrfs: read superblock for update: %w", err)
 	}
+	if err := verifySuperblockRMW(sb, buf, partOff+superblockOffset); err != nil {
+		return err
+	}
 	le := binary.LittleEndian
 	le.PutUint64(buf[sbfRootLogAddr:], sb.rootLogAddr)
 	gen := le.Uint64(buf[sbfGeneration:])

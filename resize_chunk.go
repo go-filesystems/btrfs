@@ -243,6 +243,9 @@ func (fs *btrfsFS) deleteLeafItemInPlace(phys int64, objID uint64, typ uint8, of
 	if _, err := fs.rwa.ReadAt(leaf, phys); err != nil {
 		return fmt.Errorf("read leaf: %w", err)
 	}
+	if err := verifyTreeBlock(fs.sb, leaf, phys, 0); err != nil {
+		return err
+	}
 	idx := findItemIdx(leaf, objID, typ, off)
 	if idx < 0 {
 		return fmt.Errorf("item (%d,%#x,%d) not in leaf", objID, typ, off)
@@ -262,6 +265,9 @@ func (fs *btrfsFS) deleteSysChunkArrayEntryLocked(logStart uint64) error {
 	buf := make([]byte, sbfSize)
 	if _, err := fs.rwa.ReadAt(buf, fs.partOffset+superblockOffset); err != nil {
 		return fmt.Errorf("read superblock: %w", err)
+	}
+	if err := verifySuperblockRMW(fs.sb, buf, fs.partOffset+superblockOffset); err != nil {
+		return err
 	}
 	le := binary.LittleEndian
 	arrSz := int(le.Uint32(buf[sbfSysChunkArrSz:]))

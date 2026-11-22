@@ -225,6 +225,9 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 	extRootSafe := false
 	if phys, perr := sb.physAddr(partOff, extRoot); perr == nil {
 		if _, rerr := rwaAt.ReadAt(leaf, phys); rerr == nil {
+			if cerr := verifyTreeBlock(sb, leaf, phys, extRoot); cerr != nil {
+				return cerr
+			}
 			extRootSafe = true
 		}
 	}
@@ -310,7 +313,7 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 	for _, u := range bgUsed {
 		totalUsed += u
 	}
-	return updateSuperBytesUsed(rwaAt, partOff, totalUsed)
+	return updateSuperBytesUsed(rwaAt, partOff, sb, totalUsed)
 }
 
 // updateExtentRootGeneration rewrites the EXTENT_TREE ROOT_ITEM's generation to
@@ -337,6 +340,9 @@ func updateExtentRootGeneration(rwaAt readerWriterAt, partOff int64, sb *superbl
 	leaf := make([]byte, sb.nodeSize)
 	if _, err := rwaAt.ReadAt(leaf, phys); err != nil {
 		return fmt.Errorf("read root tree leaf: %w", err)
+	}
+	if err := verifyTreeBlock(sb, leaf, phys, leafLog); err != nil {
+		return err
 	}
 	hdr := parseNodeHeader(leaf)
 	if hdr.level != 0 {
@@ -447,10 +453,13 @@ func buildDataExtentItemBytes(le binary.ByteOrder, owner, objectid, fileOffset u
 }
 
 // updateSuperBytesUsed rewrites super.bytes_used in the primary superblock.
-func updateSuperBytesUsed(rwaAt readerWriterAt, partOff int64, used uint64) error {
+func updateSuperBytesUsed(rwaAt readerWriterAt, partOff int64, sb *superblock, used uint64) error {
 	buf := make([]byte, sbfSize)
 	if _, err := rwaAt.ReadAt(buf, partOff+superblockOffset); err != nil {
 		return fmt.Errorf("read superblock for bytes_used: %w", err)
+	}
+	if err := verifySuperblockRMW(sb, buf, partOff+superblockOffset); err != nil {
+		return err
 	}
 	binary.LittleEndian.PutUint64(buf[sbfBytesUsed:], used)
 	updateSuperblockCRC(buf)

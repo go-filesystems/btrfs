@@ -60,6 +60,13 @@ func (fs *btrfsFS) SetLabel(label string) error {
 			}
 			continue // mirror unpopulated
 		}
+		// Never re-checksum a corrupt superblock (it would launder the damage).
+		if err := verifySuperblockRMW(fs.sb, buf, fs.partOffset+sbOff); err != nil {
+			if i == 0 {
+				return err
+			}
+			continue // corrupt mirror: leave it for a repair tool
+		}
 
 		// Zero the label slot, then copy. Keeps the trailing bytes clean
 		// when the new label is shorter than the previous one.

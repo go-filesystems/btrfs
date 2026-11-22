@@ -3,7 +3,7 @@ module github.com/go-filesystems/btrfs
 go 1.27.4
 
 require (
-	github.com/go-compressions/deflate v0.2.0
+	github.com/go-compressions/deflate v0.3.0
 	github.com/go-compressions/lzo v0.4.1
 	github.com/go-filesystems/inflight v0.5.0
 	github.com/go-filesystems/interface v0.6.0

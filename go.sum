@@ -1,3 +1,5 @@
+github.com/go-compressions/deflate v0.2.0 h1:ov56DlGgqFmH8tHdE2b/6G2uam6f2D1hWsjnHx3K+CY=
+github.com/go-compressions/deflate v0.2.0/go.mod h1:qVESFJ0mcqjkK1hKQDdL1qhNPMkB/NXp+Ap9EW+SANw=
 github.com/go-compressions/lzo v0.4.1 h1:lmyfO9eSvTZ7raEMHBMb39WUs7bmYKZE5BpfOQkwAWM=
 github.com/go-compressions/lzo v0.4.1/go.mod h1:dJtx0L0j59FkTKSVa5mu6JEXAeOKi9t9Z89SccSM2A4=
 github.com/go-filesystems/inflight v0.5.0 h1:JmkGgkT8/DKGLivRxUJkQUJAkOa8TLyB5W3LGIS0fxs=

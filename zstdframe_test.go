@@ -224,7 +224,8 @@ func TestZstdFrameLenBlockGuards(t *testing.T) {
 		t.Error("skippable frame accepted")
 	}
 	// Garbage in place of the magic: decode error, not a layout walk.
-	if _, err := zstdFrameLen([]byte{0, 0, 0, 0, 0x20, 5, 0x01, 0, 0}); err == nil {
+	// (with a valid last empty raw block right after the four bad bytes).
+	if _, err := zstdFrameLen([]byte{0, 0, 0, 0, 0x01, 0, 0}); err == nil {
 		t.Error("bad magic accepted")
 	}
 }

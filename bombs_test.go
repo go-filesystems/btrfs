@@ -46,10 +46,10 @@ func TestBomb_ZstdDeclaredWindow(t *testing.T) {
 
 // The window bound is exact: 2^17 is decoded, 2^18 is refused.
 func TestBomb_ZstdWindowExact(t *testing.T) {
-	if _, err := decompressZstd(zstdFrame(17), 4096); err != nil {
+	if _, err := decompressZstd(zstdFrame(17), 0); err != nil {
 		t.Fatalf("window 2^17: %v", err)
 	}
-	if _, err := decompressZstd(zstdFrame(18), 4096); err == nil {
+	if _, err := decompressZstd(zstdFrame(18), 0); err == nil {
 		t.Fatal("window 2^18 accepted")
 	}
 }

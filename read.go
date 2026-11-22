@@ -327,29 +327,36 @@ func decompressExtent(src []byte, compression uint8, ramBytes uint64) ([]byte, e
 // by the kernel; ramBytes caps the output to defend against malformed
 // input.
 func decompressZstd(src []byte, ramBytes uint64) ([]byte, error) {
-	zr, err := getZstdReader(src)
+	zd, err := getZstdDecoder()
 	if err != nil {
 		return nil, fmt.Errorf("zstd reader: %w", err)
 	}
-	defer putZstdReader(zr)
+	defer putZstdDecoder(zd)
 	// A kernel zstd extent is ONE frame followed by zero padding to the sector
 	// size (Linux v6.17 fs/btrfs/zstd.c, zstd_decompress_bio, lines 630-640:
 	// it leaves its loop once the output is complete or at the end of the
-	// frame, and never looks at the bytes after it). Reading one byte past
-	// ram_bytes, as a "stream is longer than declared" probe, makes the decoder
-	// parse the padding as a second frame and fail with "magic number mismatch".
-	// So stop at exactly ramBytes: output is still bounded by it. A frame that
-	// ends BEFORE ram_bytes is refused by the decoder when it reaches the padding
-	// (stricter than the kernel, which would accept it; no kernel-written extent
-	// has that shape).
+	// frame, and never looks at the bytes after it). zstdFrameLen finds the end
+	// of that frame from its block headers, and only src[:n] reaches the
+	// decoder: the padding (or garbage, or a second frame) is never decoded.
+	// A truncated frame, and a frame that yields fewer than ram_bytes, are
+	// refused, as the kernel returns -EIO on both (zstd.c:645-647).
 	if ramBytes > maxDecompressRAM {
 		ramBytes = maxDecompressRAM
 	}
-	out, err := readAllLimit(zr, int64(ramBytes))
+	n, err := zstdFrameLen(src)
 	if err != nil {
 		return nil, fmt.Errorf("zstd decompress: %w", err)
 	}
-	return out, nil
+	// The capacity ramBytes+16 keeps the decoder's fast copies off their
+	// bounds-exact slow path.
+	out, err := zd.DecodeAll(src[:n], make([]byte, 0, ramBytes+16))
+	if err != nil {
+		return nil, fmt.Errorf("zstd decompress: %w", err)
+	}
+	if uint64(len(out)) < ramBytes {
+		return nil, fmt.Errorf("zstd decompress: frame yields %d bytes, extent declares %d: %w", len(out), ramBytes, io.ErrUnexpectedEOF)
+	}
+	return out[:ramBytes:ramBytes], nil
 }
 
 // readSymlink reads the target of a symlink inode.

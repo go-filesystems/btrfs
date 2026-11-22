@@ -24,10 +24,10 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/go-compressions/deflate"
 	"github.com/go-filesystems/inflight"
 	"github.com/go-simd/adler32"
 	"github.com/go-volumes/safeio"
-	"github.com/klauspost/compress/flate"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -67,52 +67,44 @@ func putZstdReader(zr *zstd.Decoder) {
 // AVX-512): klauspost's zlib reader sums with a scalar loop, about 14 % of the
 // time of a 128 KiB extent on a 1-CPU read.
 
-type zlibInflater struct {
-	br *bytes.Reader
-	fr io.ReadCloser // a flate.Resetter
-}
-
-var zlibPool sync.Pool // *zlibInflater
-
 var errZlibHeader = errors.New("zlib: invalid header")
 
-// getZlibReader checks the 2-byte header of src and returns an inflater
-// positioned on the DEFLATE stream.
-func getZlibReader(src []byte) (*zlibInflater, error) {
+// inflateZlib expands the zlib stream src, whole, with go-compressions/deflate
+// (a table-driven decoder over the whole buffer, several times klauspost's
+// streaming reader) and checks the trailer. The result is at most limit bytes:
+// a stream that would produce more stops there without error and without the
+// trailer check, as readAllLimit did, so the caller sees len(out) == limit and
+// refuses it as larger than declared.
+func inflateZlib(src []byte, limit int64) ([]byte, error) {
 	if len(src) < 2 {
 		return nil, io.ErrUnexpectedEOF
 	}
 	if src[0]&0x0f != 8 || src[0]>>4 > 7 || (uint(src[0])<<8|uint(src[1]))%31 != 0 || src[1]&0x20 != 0 {
 		return nil, errZlibHeader
 	}
-	body := src[2:]
-	if v := zlibPool.Get(); v != nil {
-		z := v.(*zlibInflater)
-		z.br.Reset(body)
-		if err := z.fr.(flate.Resetter).Reset(z.br, nil); err == nil {
-			return z, nil
-		}
+	// limit is decompressLimit's: at most maxDecompressRAM+1, so it fits an int
+	// on every platform; the clamp keeps that true if a caller changes.
+	if limit > maxDecompressRAM+1 {
+		limit = maxDecompressRAM + 1
 	}
-	z := &zlibInflater{br: bytes.NewReader(body)}
-	z.fr = flate.NewReader(z.br)
-	return z, nil
-}
-
-func putZlibReader(z *zlibInflater) {
-	z.br.Reset(nil)
-	zlibPool.Put(z)
-}
-
-// zlibTrailer verifies the Adler-32 that follows the DEFLATE stream.
-func (z *zlibInflater) zlibTrailer(out []byte) error {
-	var t [4]byte
-	if _, err := io.ReadFull(z.br, t[:]); err != nil {
-		return io.ErrUnexpectedEOF
+	if limit < 0 {
+		limit = 0
 	}
-	if binary.BigEndian.Uint32(t[:]) != adler32.Checksum(out) {
-		return errors.New("zlib: invalid checksum")
+	out, n, err := deflate.InflatePrefix(make([]byte, 0, int(limit)), src[2:], int(limit))
+	if errors.Is(err, deflate.ErrTooLarge) {
+		return out, nil
 	}
-	return nil
+	if err != nil {
+		return out, err
+	}
+	trailer := src[2+n:]
+	if len(trailer) < 4 {
+		return out, io.ErrUnexpectedEOF
+	}
+	if binary.BigEndian.Uint32(trailer) != adler32.Checksum(out) {
+		return out, errors.New("zlib: invalid checksum")
+	}
+	return out, nil
 }
 
 // readAllLimit reads r to its end or until limit bytes, whichever is first. The

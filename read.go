@@ -305,22 +305,12 @@ func decompressExtent(src []byte, compression uint8, ramBytes uint64) ([]byte, e
 	case compressionNone:
 		return src, nil
 	case compressionZlib:
-		zr, err := getZlibReader(src)
-		if err != nil {
-			return nil, fmt.Errorf("zlib reader: %w", err)
-		}
-		defer putZlibReader(zr)
-		// Cap reads at ramBytes + a small slack so a malformed stream cannot
+		// Cap the output at ramBytes + a small slack so a malformed stream cannot
 		// allocate unbounded memory. ramBytes is clamped to the hard ceiling
 		// so a huge or overflowing declared size can't defeat the limit.
-		out, err := readAllLimit(zr.fr, decompressLimit(ramBytes))
+		out, err := inflateZlib(src, decompressLimit(ramBytes))
 		if err != nil {
 			return nil, fmt.Errorf("zlib decompress: %w", err)
-		}
-		if int64(len(out)) < decompressLimit(ramBytes) {
-			if err := zr.zlibTrailer(out); err != nil {
-				return nil, fmt.Errorf("zlib decompress: %w", err)
-			}
 		}
 		return out, nil
 	case compressionLzo:

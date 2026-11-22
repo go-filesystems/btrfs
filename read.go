@@ -2,10 +2,12 @@ package filesystem_btrfs
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
 	"github.com/go-volumes/safeio"
+	"github.com/klauspost/compress/zstd"
 )
 
 // EXTENT_DATA item layout (btrfs_file_extent_item):
@@ -327,11 +329,11 @@ func decompressExtent(src []byte, compression uint8, ramBytes uint64) ([]byte, e
 // by the kernel; ramBytes caps the output to defend against malformed
 // input.
 func decompressZstd(src []byte, ramBytes uint64) ([]byte, error) {
-	zr, err := getZstdReader(src)
+	zd, err := getZstdDecoder()
 	if err != nil {
 		return nil, fmt.Errorf("zstd reader: %w", err)
 	}
-	defer putZstdReader(zr)
+	defer putZstdDecoder(zd)
 	// A kernel zstd extent is ONE frame followed by zero padding to the sector
 	// size (Linux v6.17 fs/btrfs/zstd.c, zstd_decompress_bio, lines 630-640:
 	// it leaves its loop once the output is complete or at the end of the
@@ -345,9 +347,15 @@ func decompressZstd(src []byte, ramBytes uint64) ([]byte, error) {
 	if ramBytes > maxDecompressRAM {
 		ramBytes = maxDecompressRAM
 	}
-	out, err := readAllLimit(zr, int64(ramBytes))
-	if err != nil {
+	// DecodeAll decodes the frame into out, then meets the sector padding and
+	// reports a magic mismatch with the finished output in hand: that is the
+	// kernel's end of extent, not an error, once ram_bytes are produced.
+	out, err := zd.DecodeAll(src, make([]byte, 0, ramBytes))
+	if err != nil && !(errors.Is(err, zstd.ErrMagicMismatch) && uint64(len(out)) >= ramBytes) {
 		return nil, fmt.Errorf("zstd decompress: %w", err)
+	}
+	if uint64(len(out)) > ramBytes {
+		out = out[:ramBytes]
 	}
 	return out, nil
 }

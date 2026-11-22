@@ -68,7 +68,12 @@ file (zlib, LZO, zstd) on up to `min(GOMAXPROCS, 8)` goroutines
 file order; `SetReadParallelism(n)` on the filesystem, 1 = serial and nothing is
 spawned). The EXTENT_DATA items are still walked and checked serially, and the
 error returned is the first in file order whatever the workers' speeds. The zstd
-and zlib decoders are pooled.
+and zlib decoders are pooled. A zstd extent is decoded as exactly one frame: its
+end is found from the block headers (RFC 8878 section 3.1.1), the sector padding
+after it is never decoded, and a truncated frame, a skippable frame, a reserved
+block type or a frame yielding fewer bytes than `ram_bytes` is refused, as the
+kernel returns -EIO on a short extent. The zstd row of the table below predates
+this change and has not been re-measured.
 
 A `ReadAt` of 1 MiB holds only 8 extents of 128 KiB, so decoding each call alone
 fills the workers and drains them again. A read that continues the previous one,

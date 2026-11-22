@@ -15,6 +15,8 @@ func fuzzAllocBudget(inputLen int) uint64 { return 4<<20 + 64*uint64(inputLen) }
 func FuzzDecompressExtent(f *testing.F) {
 	f.Add(byte(1), uint64(4096), zstdFrame(17))
 	f.Add(byte(3), uint64(1<<40), []byte{8, 0, 0, 0, 0, 0, 0, 0})
+	raw, padded := zstdExtent(f)
+	f.Add(byte(3), uint64(len(raw)), padded)
 	f.Add(byte(2), uint64(0), []byte{})
 	f.Fuzz(func(t *testing.T, codec byte, ram uint64, src []byte) {
 		var out []byte

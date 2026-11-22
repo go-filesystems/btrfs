@@ -11,7 +11,7 @@ require (
 )
 
 require (
-	github.com/go-compressions/deflate v0.2.0 // indirect
+	github.com/go-compressions/deflate v0.3.0 // indirect
 	github.com/go-compressions/lzo v0.4.1 // indirect
 	github.com/go-filesystems/inflight v0.5.0 // indirect
 	github.com/go-simd/adler32 v0.2.0 // indirect

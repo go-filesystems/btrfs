@@ -166,3 +166,65 @@ func FuzzZstdFrameLen(f *testing.F) {
 		}
 	})
 }
+
+func TestZstdFrameLenRefusals(t *testing.T) {
+	_, frame := zstdFrameOnly(t)
+	for name, src := range map[string][]byte{
+		"empty":              nil,
+		"zeros":              make([]byte, 4096),
+		"bad magic":          append([]byte{1, 2, 3, 4}, frame[4:]...),
+		"skippable, a block": {0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 1, 0, 0},
+		"reserved bit":       {0x28, 0xB5, 0x2F, 0xFD, 0x08, 0x00, 0x01, 0x00, 0x00},
+	} {
+		if n, err := zstdFrameLen(src); err == nil {
+			t.Errorf("%s: accepted, n=%d", name, n)
+		}
+	}
+	// An empty last raw block with the checksum flag but no checksum bytes.
+	if n, err := zstdFrameLen([]byte{0x28, 0xB5, 0x2F, 0xFD, 0x04, 0x00, 0x01, 0x00, 0x00}); err == nil {
+		t.Errorf("missing checksum accepted, n=%d", n)
+	}
+	if n, err := zstdFrameLen([]byte{0x28, 0xB5, 0x2F, 0xFD, 0x04, 0x00, 0x01, 0x00, 0x00, 1, 2, 3, 4, 9}); err != nil || n != 13 {
+		t.Errorf("checksummed frame: n=%d err=%v", n, err)
+	}
+}
+
+// Both sides of the block guards, asserted on the layout itself.
+func TestZstdFrameLenBlockGuards(t *testing.T) {
+	// single-segment frame, 1-byte content size: 6 header bytes.
+	hdr := []byte{0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x05}
+	with := func(block ...byte) []byte { return append(append([]byte{}, hdr...), block...) }
+	// last, Raw, size 5 = 5<<3 | 0<<1 | 1 = 0x29.
+	if n, err := zstdFrameLen(with(0x29, 0, 0, 1, 2, 3, 4, 5)); err != nil || n != 14 {
+		t.Errorf("exact raw block: n=%d err=%v", n, err)
+	}
+	if _, err := zstdFrameLen(with(0x29, 0, 0, 1, 2, 3, 4)); err == nil {
+		t.Error("raw block one byte short accepted")
+	}
+	// last, RLE, size 5 = 0x2B: ONE content byte.
+	if n, err := zstdFrameLen(with(0x2B, 0, 0, 7)); err != nil || n != 10 {
+		t.Errorf("RLE block: n=%d err=%v", n, err)
+	}
+	// last, Reserved (3), size 0 = 0x07.
+	if _, err := zstdFrameLen(with(0x07, 0, 0)); err == nil {
+		t.Error("reserved block type accepted")
+	}
+	// not last, empty raw block, then last empty raw block: two blocks.
+	if n, err := zstdFrameLen(with(0x00, 0, 0, 0x01, 0, 0)); err != nil || n != 12 {
+		t.Errorf("two blocks: n=%d err=%v", n, err)
+	}
+	if _, err := zstdFrameLen(with(0x00, 0, 0)); err == nil {
+		t.Error("frame ending on a non-last block accepted")
+	}
+	if _, err := zstdFrameLen(with(0x01, 0)); err == nil {
+		t.Error("two-byte block header accepted")
+	}
+	// A skippable frame whose payload looks like a valid block.
+	if _, err := zstdFrameLen([]byte{0x5F, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 0x01, 0, 0}); err == nil {
+		t.Error("skippable frame accepted")
+	}
+	// Garbage in place of the magic: decode error, not a layout walk.
+	if _, err := zstdFrameLen([]byte{0, 0, 0, 0, 0x20, 5, 0x01, 0, 0}); err == nil {
+		t.Error("bad magic accepted")
+	}
+}

@@ -35,6 +35,12 @@ type superblock struct {
 	generation uint64 // superblock generation (incremented on every write)
 
 	sysChunks []chunkMapping
+
+	// csumType is the superblock's csum_type (0 = crc32c, the only one
+	// implemented). ignoreCsum is the forensic opt-out (OpenOptions.
+	// IgnoreChecksums): tree-block checksums are then not verified.
+	csumType   uint16
+	ignoreCsum bool
 }
 
 // chunkStripe is one (device, physical-offset) pair within a chunk.
@@ -170,9 +176,18 @@ const (
 // Key size on disk (objectid:8 + type:1 + offset:8 = 17 bytes).
 const keySize = 17
 
+// readSuperblock reads and verifies the primary superblock (no backup
+// fallback, checksums enforced).
 func readSuperblock(r io.ReaderAt, partOff int64) (*superblock, error) {
+	return readSuperblockAt(r, partOff, superblockOffset, false)
+}
+
+// readSuperblockAt reads the superblock copy at sbOff (relative to partOff),
+// verifying its magic, csum_type and checksum (unless ignoreCsum; an
+// unsupported csum_type is refused even then).
+func readSuperblockAt(r io.ReaderAt, partOff, sbOff int64, ignoreCsum bool) (*superblock, error) {
 	buf := make([]byte, sbfSize)
-	if _, err := r.ReadAt(buf, partOff+superblockOffset); err != nil {
+	if _, err := r.ReadAt(buf, partOff+sbOff); err != nil {
 		return nil, fmt.Errorf("btrfs: read superblock: %w", err)
 	}
 	le := binary.LittleEndian
@@ -180,10 +195,21 @@ func readSuperblock(r io.ReaderAt, partOff int64) (*superblock, error) {
 	magic := le.Uint64(buf[sbfMagic:])
 	if magic != sbMagic {
 		return nil, fmt.Errorf("btrfs: bad superblock magic 0x%016X at offset 0x%X",
-			magic, partOff+superblockOffset)
+			magic, partOff+sbOff)
+	}
+	csumType := le.Uint16(buf[sbfCsumType:])
+	if err := checkCsumType(csumType); err != nil {
+		return nil, err
+	}
+	if !ignoreCsum {
+		if err := verifySuperblockBuf(buf, partOff+sbOff); err != nil {
+			return nil, err
+		}
 	}
 
 	sb := &superblock{
+		csumType:     csumType,
+		ignoreCsum:   ignoreCsum,
 		sectorSize:   le.Uint32(buf[sbfSectorSize:]),
 		nodeSize:     le.Uint32(buf[sbfNodeSize:]),
 		leafSize:     le.Uint32(buf[sbfLeafSize:]),

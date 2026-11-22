@@ -2,6 +2,7 @@ package filesystem_btrfs
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -224,9 +225,13 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 	leaf := make([]byte, sb.nodeSize)
 	extRootSafe := false
 	if phys, perr := sb.physAddr(partOff, extRoot); perr == nil {
-		if _, rerr := rwaAt.ReadAt(leaf, phys); rerr == nil {
-			extRootSafe = true
+		// A read failure means the old extent root is unreachable (handled
+		// below); a checksum failure means it is reachable but corrupt: refuse.
+		rerr := readTreeBlockAt(rwaAt, sb, leaf, phys, extRoot)
+		if errors.Is(rerr, ErrChecksum) {
+			return rerr
 		}
+		extRootSafe = rerr == nil
 	}
 	if !extRootSafe {
 		tpl, terr := extentHeaderTemplate(rwaAt, partOff, sb)
@@ -310,7 +315,7 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 	for _, u := range bgUsed {
 		totalUsed += u
 	}
-	return updateSuperBytesUsed(rwaAt, partOff, totalUsed)
+	return updateSuperBytesUsed(rwaAt, partOff, sb, totalUsed)
 }
 
 // updateExtentRootGeneration rewrites the EXTENT_TREE ROOT_ITEM's generation to
@@ -335,7 +340,7 @@ func updateExtentRootGeneration(rwaAt readerWriterAt, partOff int64, sb *superbl
 		return fmt.Errorf("locate root tree leaf: %w", err)
 	}
 	leaf := make([]byte, sb.nodeSize)
-	if _, err := rwaAt.ReadAt(leaf, phys); err != nil {
+	if err := readTreeBlockAt(rwaAt, sb, leaf, phys, leafLog); err != nil {
 		return fmt.Errorf("read root tree leaf: %w", err)
 	}
 	hdr := parseNodeHeader(leaf)
@@ -447,10 +452,13 @@ func buildDataExtentItemBytes(le binary.ByteOrder, owner, objectid, fileOffset u
 }
 
 // updateSuperBytesUsed rewrites super.bytes_used in the primary superblock.
-func updateSuperBytesUsed(rwaAt readerWriterAt, partOff int64, used uint64) error {
+func updateSuperBytesUsed(rwaAt readerWriterAt, partOff int64, sb *superblock, used uint64) error {
 	buf := make([]byte, sbfSize)
 	if _, err := rwaAt.ReadAt(buf, partOff+superblockOffset); err != nil {
 		return fmt.Errorf("read superblock for bytes_used: %w", err)
+	}
+	if err := verifySuperblockRMW(sb, buf, partOff+superblockOffset); err != nil {
+		return err
 	}
 	binary.LittleEndian.PutUint64(buf[sbfBytesUsed:], used)
 	updateSuperblockCRC(buf)

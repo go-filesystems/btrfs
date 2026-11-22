@@ -240,7 +240,7 @@ func (fs *btrfsFS) deleteBlockGroupItemLocked(chunkLogStart, size uint64) error 
 // the same physical block (transid stays valid). Caller holds fs.mu.
 func (fs *btrfsFS) deleteLeafItemInPlace(phys int64, objID uint64, typ uint8, off uint64) error {
 	leaf := make([]byte, fs.sb.nodeSize)
-	if _, err := fs.rwa.ReadAt(leaf, phys); err != nil {
+	if err := readTreeBlockAt(fs.rwa, fs.sb, leaf, phys, 0); err != nil {
 		return fmt.Errorf("read leaf: %w", err)
 	}
 	idx := findItemIdx(leaf, objID, typ, off)
@@ -262,6 +262,9 @@ func (fs *btrfsFS) deleteSysChunkArrayEntryLocked(logStart uint64) error {
 	buf := make([]byte, sbfSize)
 	if _, err := fs.rwa.ReadAt(buf, fs.partOffset+superblockOffset); err != nil {
 		return fmt.Errorf("read superblock: %w", err)
+	}
+	if err := verifySuperblockRMW(fs.sb, buf, fs.partOffset+superblockOffset); err != nil {
+		return err
 	}
 	le := binary.LittleEndian
 	arrSz := int(le.Uint32(buf[sbfSysChunkArrSz:]))

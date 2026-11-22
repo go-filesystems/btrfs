@@ -99,7 +99,8 @@ interleaved rounds in a calibrated uniform regime (`kerneljudge` v0.4.0,
 that of v0.6.3; v0.6.4 is below.)
 
 zlib extents are inflated, from v0.6.4, by the whole-buffer raw DEFLATE decoder of
-go-compressions/deflate v0.2.0 (`InflatePrefix`, which also reports where the
+go-compressions/deflate (v0.2.0 when measured; v0.3.0 since v0.6.5, not
+re-measured) (`InflatePrefix`, which also reports where the
 stream ends so the Adler-32 trailer, checked with go-simd/adler32, can be read).
 On the host, one core, 128 KiB extents, the extent decode alone went from 396
 MiB/s to 1.03 GiB/s (geometric mean of six inputs, +166 %, time -62 %, 6
@@ -107,7 +108,10 @@ interleaved rounds against v0.6.3). Against the kernel in the same VM run, zlib
 sequential reads go from 0.91 to 2.15 of its speed at 1 CPU (763 / 354 MiB/s)
 and from 0.87 to 1.89 at 4 CPUs (2304 / 1222 MiB/s). Before v0.6.4 the stream
 was inflated by klauspost/compress, and zlib stayed behind the kernel. LZO at 4
-CPUs and zlib are ahead of the kernel; zstd at 4 CPUs (0.78) is not.
+CPUs and zlib are ahead of the kernel; zstd at 4 CPUs (0.78) is not. v0.6.5
+decodes a zstd extent with one `DecodeAll` into one buffer (1 allocation per
+extent instead of 2, counted on the host); its effect on that 0.78 is NOT YET
+MEASURED, because the host load never fell under 8 (btrfs#56 stays open).
 
 Fully covered LZO extents decode straight into the output buffer, with no
 allocation per extent (one 128 KiB allocation and copy before); this gives no

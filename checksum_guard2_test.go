@@ -7,6 +7,20 @@ import (
 
 var errBoom = errors.New("boom")
 
+// Kept first in the package so that a deleted `err == nil` early return in
+// readSuperblockFallback is reported by this assertion, not by a later nil
+// dereference.
+func TestCsumGuardFallbackReturnsValidPrimary(t *testing.T) {
+	good := goodSuperblockCopy(t)
+	sb, err := readSuperblockFallback(sparseDev{superblockOffset: good, backupSuperblockOffsets[0]: withGeneration(good, 99)}, 0, false)
+	if err != nil || sb == nil {
+		t.Fatalf("valid primary: sb=%v err=%v", sb != nil, err)
+	}
+	if sb.generation == 99 {
+		t.Fatal("a valid primary must not be replaced by a backup")
+	}
+}
+
 type failReader struct{}
 
 func (failReader) ReadAt([]byte, int64) (int, error) { return 0, errBoom }
@@ -108,13 +122,3 @@ func TestCsumGuardCRCBoundaries(t *testing.T) {
 	}()
 }
 
-func TestCsumGuardFallbackReturnsValidPrimary(t *testing.T) {
-	good := goodSuperblockCopy(t)
-	sb, err := readSuperblockFallback(sparseDev{superblockOffset: good, backupSuperblockOffsets[0]: withGeneration(good, 99)}, 0, false)
-	if err != nil || sb == nil {
-		t.Fatalf("valid primary: %v, %v", sb, err)
-	}
-	if sb.generation == 99 {
-		t.Fatal("a valid primary must not be replaced by a backup")
-	}
-}

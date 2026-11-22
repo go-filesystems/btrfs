@@ -2,6 +2,7 @@ package filesystem_btrfs
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -224,12 +225,13 @@ func rebuildExtentTree(rwaAt readerWriterAt, partOff int64, sb *superblock, sm *
 	leaf := make([]byte, sb.nodeSize)
 	extRootSafe := false
 	if phys, perr := sb.physAddr(partOff, extRoot); perr == nil {
-		if _, rerr := rwaAt.ReadAt(leaf, phys); rerr == nil {
-			if cerr := verifyTreeBlock(sb, leaf, phys, extRoot); cerr != nil {
-				return cerr
-			}
-			extRootSafe = true
+		// A read failure means the old extent root is unreachable (handled
+		// below); a checksum failure means it is reachable but corrupt: refuse.
+		rerr := readTreeBlockAt(rwaAt, sb, leaf, phys, extRoot)
+		if errors.Is(rerr, ErrChecksum) {
+			return rerr
 		}
+		extRootSafe = rerr == nil
 	}
 	if !extRootSafe {
 		tpl, terr := extentHeaderTemplate(rwaAt, partOff, sb)
@@ -338,11 +340,8 @@ func updateExtentRootGeneration(rwaAt readerWriterAt, partOff int64, sb *superbl
 		return fmt.Errorf("locate root tree leaf: %w", err)
 	}
 	leaf := make([]byte, sb.nodeSize)
-	if _, err := rwaAt.ReadAt(leaf, phys); err != nil {
+	if err := readTreeBlockAt(rwaAt, sb, leaf, phys, leafLog); err != nil {
 		return fmt.Errorf("read root tree leaf: %w", err)
-	}
-	if err := verifyTreeBlock(sb, leaf, phys, leafLog); err != nil {
-		return err
 	}
 	hdr := parseNodeHeader(leaf)
 	if hdr.level != 0 {

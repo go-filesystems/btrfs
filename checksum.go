@@ -126,6 +126,16 @@ func verifyTreeBlock(sb *superblock, buf []byte, phys int64, logAddr uint64) err
 	return nil
 }
 
+// readTreeBlockAt reads one tree block of len(buf) bytes from phys (logical
+// address logAddr) and verifies its checksum: the single place where a tree
+// block enters the package from the device.
+func readTreeBlockAt(r io.ReaderAt, sb *superblock, buf []byte, phys int64, logAddr uint64) error {
+	if _, err := r.ReadAt(buf, phys); err != nil {
+		return err
+	}
+	return verifyTreeBlock(sb, buf, phys, logAddr)
+}
+
 // verifySuperblockBuf checks the checksum of a 4 KiB superblock image read from
 // phys.
 func verifySuperblockBuf(buf []byte, phys int64) error {

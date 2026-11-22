@@ -482,11 +482,8 @@ func (fs *btrfsFS) relocateLeafBlock(oldLog, limit uint64) (uint64, error) {
 		return 0, fmt.Errorf("locate block 0x%X: %w", oldLog, err)
 	}
 	buf := make([]byte, fs.sb.nodeSize)
-	if _, err := fs.rwa.ReadAt(buf, oldPhys); err != nil {
+	if err := readTreeBlockAt(fs.rwa, fs.sb, buf, oldPhys, oldLog); err != nil {
 		return 0, fmt.Errorf("read block 0x%X: %w", oldLog, err)
-	}
-	if err := verifyTreeBlock(fs.sb, buf, oldPhys, oldLog); err != nil {
-		return 0, err
 	}
 	return fs.relocateNodeBuffer(buf, limit)
 }
@@ -518,11 +515,8 @@ func (fs *btrfsFS) repointRootItemLocked(objID, newBytenr uint64) error {
 		return fmt.Errorf("locate root tree leaf: %w", err)
 	}
 	leaf := make([]byte, fs.sb.nodeSize)
-	if _, err := fs.rwa.ReadAt(leaf, phys); err != nil {
+	if err := readTreeBlockAt(fs.rwa, fs.sb, leaf, phys, leafLog); err != nil {
 		return fmt.Errorf("read root tree leaf: %w", err)
-	}
-	if err := verifyTreeBlock(fs.sb, leaf, phys, leafLog); err != nil {
-		return err
 	}
 	if parseNodeHeader(leaf).level != 0 {
 		return fmt.Errorf("ROOT_ITEM %d leaf 0x%X is not a leaf", objID, leafLog)

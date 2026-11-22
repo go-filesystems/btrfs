@@ -64,13 +64,10 @@ func (c *cowCtx) cowNode(oldLogAddr uint64) (uint64, int64, []byte, error) {
 		return 0, 0, nil, err
 	}
 	buf := make([]byte, c.sb.nodeSize)
-	if _, err := c.rwa.ReadAt(buf, oldPhys); err != nil {
-		return 0, 0, nil, fmt.Errorf("btrfs: cow read node: %w", err)
-	}
 	// COW re-checksums the copy: verify the original first so a tampered block
 	// is not laundered into a valid one.
-	if err := verifyTreeBlock(c.sb, buf, oldPhys, oldLogAddr); err != nil {
-		return 0, 0, nil, err
+	if err := readTreeBlockAt(c.rwa, c.sb, buf, oldPhys, oldLogAddr); err != nil {
+		return 0, 0, nil, fmt.Errorf("btrfs: cow read node: %w", err)
 	}
 
 	// Allocate a new physical block.

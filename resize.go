@@ -340,11 +340,8 @@ func (fs *btrfsFS) rewriteChunkSizeLocked(logStart, newSize uint64) error {
 		return fmt.Errorf("locate chunk tree node: %w", err)
 	}
 	leafBuf := make([]byte, fs.sb.nodeSize)
-	if _, err := fs.rwa.ReadAt(leafBuf, phys); err != nil {
+	if err := readTreeBlockAt(fs.rwa, fs.sb, leafBuf, phys, fs.sb.chunkLogAddr); err != nil {
 		return fmt.Errorf("read chunk tree node: %w", err)
-	}
-	if err := verifyTreeBlock(fs.sb, leafBuf, phys, fs.sb.chunkLogAddr); err != nil {
-		return err
 	}
 	idx := findItemIdx(leafBuf, firstChunkTreeObjID, typeChunkItem, logStart)
 	if idx < 0 {
@@ -596,11 +593,8 @@ func (fs *btrfsFS) rewriteChunkTreeDevItemLocked(totalBytes, bytesUsed uint64) e
 		return fmt.Errorf("locate chunk tree node: %w", err)
 	}
 	leafBuf := make([]byte, fs.sb.nodeSize)
-	if _, err := fs.rwa.ReadAt(leafBuf, phys); err != nil {
+	if err := readTreeBlockAt(fs.rwa, fs.sb, leafBuf, phys, fs.sb.chunkLogAddr); err != nil {
 		return fmt.Errorf("read chunk tree node: %w", err)
-	}
-	if err := verifyTreeBlock(fs.sb, leafBuf, phys, fs.sb.chunkLogAddr); err != nil {
-		return err
 	}
 	if parseNodeHeader(leafBuf).level != 0 {
 		return nil

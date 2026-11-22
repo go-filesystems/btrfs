@@ -406,11 +406,8 @@ func repointExtentRoot(rwaAt readerWriterAt, partOff int64, sb *superblock, newR
 		return fmt.Errorf("locate root tree leaf: %w", err)
 	}
 	leaf := make([]byte, sb.nodeSize)
-	if _, err := rwaAt.ReadAt(leaf, phys); err != nil {
+	if err := readTreeBlockAt(rwaAt, sb, leaf, phys, leafLog); err != nil {
 		return fmt.Errorf("read root tree leaf: %w", err)
-	}
-	if err := verifyTreeBlock(sb, leaf, phys, leafLog); err != nil {
-		return err
 	}
 	idx := findItemIdx(leaf, extentTreeObjID, typeRootItem, 0)
 	if idx < 0 {

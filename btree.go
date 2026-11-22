@@ -155,13 +155,10 @@ func readNodeUncached(r io.ReaderAt, partOff int64, sb *superblock, logAddr uint
 	if err != nil {
 		return nil, fmt.Errorf("btrfs: node alloc (nodeSize=%d): %w", sb.nodeSize, err)
 	}
-	if _, err := r.ReadAt(buf, phys); err != nil {
+	// The block is verified against its stored checksum before anything parses
+	// it (see checksum.go for the format reference).
+	if err := readTreeBlockAt(r, sb, buf, phys, logAddr); err != nil {
 		return nil, fmt.Errorf("btrfs: read node at phys 0x%X: %w", phys, err)
-	}
-	// Verify the block against its stored checksum before anything parses it
-	// (see checksum.go for the format reference).
-	if err := verifyTreeBlock(sb, buf, int64(phys), logAddr); err != nil {
-		return nil, err
 	}
 	return buf, nil
 }

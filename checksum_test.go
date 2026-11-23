@@ -18,6 +18,14 @@ const csumTestSecret = "ORIGINAL-CONTENT-0123456789"
 func csumImage(t *testing.T) string {
 	t.Helper()
 	img := filepath.Join(t.TempDir(), "img")
+	// Format reopens the image it wrote, so a defect in the open path would
+	// panic here. Report it as a failure of this test: a panic ends the whole
+	// test binary and hides every test after it.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("formatting the fixture panicked: %v", r)
+		}
+	}()
 	fsys, err := Format(img, 128<<20, FormatConfig{})
 	if err != nil {
 		t.Fatal(err)
